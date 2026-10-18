@@ -8,7 +8,7 @@ import 'transport.dart';
 /// Elle répond seule aux PING, accuse réception des textes et attend les
 /// accusés de ses propres messages.
 class Session {
-  Session(this._transport) {
+  Session(this._transport, {this.autoAck = true}) {
     _remoteHello.future.ignore();
     _sub = _transport.incoming.listen(
       _onData,
@@ -18,6 +18,8 @@ class Session {
   }
 
   final Transport _transport;
+  final bool autoAck;
+
   final FrameDecoder _decoder = FrameDecoder();
   late final StreamSubscription<Uint8List> _sub;
 
@@ -51,16 +53,21 @@ class Session {
   }
 
   Future<void> sendHello({required String deviceId, required String name}) =>
-      send(Frame.json(FrameType.hello, {
-        'deviceId': deviceId,
-        'name': name,
-        'protocol': protocolVersion,
-      }));
+      send(
+        Frame.json(FrameType.hello, {
+          'deviceId': deviceId,
+          'name': name,
+          'protocol': protocolVersion,
+        }),
+      );
 
   /// Envoie un texte et attend l'accusé de réception de l'autre appareil.
   /// Si l'accusé n'arrive pas à temps, lève une [TimeoutException].
-  Future<void> sendText(String id, String text,
-      {Duration timeout = const Duration(seconds: 5)}) async {
+  Future<void> sendText(
+    String id,
+    String text, {
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
     final c = Completer<void>();
     c.future.ignore();
     _pendingAcks[id] = c;
@@ -73,8 +80,7 @@ class Session {
   }
 
   /// Envoie un PING et renvoie le temps mis pour recevoir le PONG.
-  Future<Duration> ping(
-      {Duration timeout = const Duration(seconds: 5)}) async {
+  Future<Duration> ping({Duration timeout = const Duration(seconds: 5)}) async {
     final c = Completer<void>();
     c.future.ignore();
     _pongWaiters.add(c);
@@ -138,7 +144,11 @@ class Session {
           {
             final data = f.json;
             if (!_texts.isClosed) _texts.add(data);
-            unawaited(_safeSend(Frame.json(FrameType.ack, {'id': data['id']})));
+            if (autoAck) {
+              unawaited(
+                _safeSend(Frame.json(FrameType.ack, {'id': data['id']})),
+              );
+            }
           }
         case FrameType.ack:
           {
