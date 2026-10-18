@@ -1,121 +1,198 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-void main() {
-  runApp(const MyApp());
+import 'bluetooth/bluetooth_bridge.dart';
+import 'protocol/session.dart';
+
+void main() => runApp(const MaterialApp(home: BtTestPage()));
+
+class BtTestPage extends StatefulWidget {
+  const BtTestPage({super.key});
+  @override
+  State<BtTestPage> createState() => _BtTestPageState();
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class _BtTestPageState extends State<BtTestPage> {
+  final _bt = BluetoothBridge.instance;
+  final _log = <String>[];
+  final _input = TextEditingController();
+  List<BtDevice> _devices = [];
+  Session? _session;
+  bool _listening = false;
+  bool _busy = false;
+  int _n = 0;
 
-  // This widget is the root of your application.
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  void _add(String s) {
+    if (!mounted) return;
+    setState(() => _log.insert(0, s));
+  }
+
+  Future<void> _prepare() async {
+    try {
+      if (!await _bt.ensurePermissions()) {
+        _add('Permission Bluetooth refusée');
+        return;
+      }
+      if (!await _bt.isEnabled()) {
+        _add('Active le Bluetooth du téléphone');
+        return;
+      }
+      final d = await _bt.bondedDevices();
+      if (!mounted) return;
+      setState(() => _devices = d);
+      _add('${d.length} appareil(s) associé(s)');
+    } catch (e) {
+      _add('Erreur : $e');
+    }
+  }
+
+  void _attach(BluetoothTransport t) {
+    final s = Session(t);
+    _session = s;
+    _add('Connecté à ${t.remoteName}');
+    s.frames.listen(
+      (f) => _add('← trame ${f.type}, ${f.payload.length} octets'),
     );
-  }
-}
-
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
-
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
-}
-
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
-
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+    s.texts.listen((m) => _add('← ${m['text']}'));
+    s.done.then((_) {
+      if (identical(_session, s)) {
+        _session = null;
+        _add('Déconnecté');
+        if (mounted) setState(() {});
+      }
     });
+    s.sendHello(deviceId: 'test', name: 'Téléphone').catchError((_) {});
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _listen() async {
+    setState(() => _listening = true);
+    _add('En attente d\'une connexion…');
+    try {
+      _attach(await _bt.listen());
+    } catch (e) {
+      _add('Attente : $e');
+    }
+    if (mounted) setState(() => _listening = false);
+  }
+
+  Future<void> _connect(BtDevice d) async {
+    setState(() => _busy = true);
+    _add('Connexion à ${d.name}…');
+    try {
+      _attach(await _bt.connect(d.address));
+    } catch (e) {
+      _add('Connexion : $e');
+    }
+    if (mounted) setState(() => _busy = false);
+  }
+
+  Future<void> _ping() async {
+    final s = _session;
+    if (s == null) return;
+    try {
+      final dt = await s.ping();
+      _add('PONG reçu en ${dt.inMilliseconds} ms');
+    } catch (e) {
+      _add('PING : $e');
+    }
+  }
+
+  Future<void> _sendText() async {
+    final s = _session;
+    final text = _input.text;
+    if (s == null || text.isEmpty) return;
+    _input.clear();
+    final id = '${DateTime.now().microsecondsSinceEpoch}-${_n++}';
+    try {
+      await s.sendText(id, text);
+      _add('→ $text  (reçu ✓)');
+    } on TimeoutException {
+      _add('→ $text  (pas d\'accusé)');
+    } catch (e) {
+      _add('Envoi : $e');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    final connected = _session != null;
     return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      appBar: AppBar(title: const Text('BlueTalk – test Bluetooth')),
+      body: Padding(
+        padding: const EdgeInsets.all(12),
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            if (!connected) ...[
+              Wrap(
+                spacing: 8,
+                children: [
+                  FilledButton(
+                    onPressed: (_listening || _busy) ? null : _listen,
+                    child: const Text('Attendre une connexion'),
+                  ),
+                  if (_listening)
+                    OutlinedButton(
+                      onPressed: _bt.stopListening,
+                      child: const Text('Annuler'),
+                    ),
+                  TextButton(
+                    onPressed: _prepare,
+                    child: const Text('Actualiser'),
+                  ),
+                ],
+              ),
+              SizedBox(
+                height: 150,
+                child: ListView(
+                  children: [
+                    for (final d in _devices)
+                      ListTile(
+                        dense: true,
+                        title: Text(d.name),
+                        subtitle: Text(d.address),
+                        onTap: (_listening || _busy) ? null : () => _connect(d),
+                      ),
+                  ],
+                ),
+              ),
+            ] else
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _input,
+                      decoration: const InputDecoration(hintText: 'Message'),
+                      onSubmitted: (_) => _sendText(),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: _sendText,
+                    icon: const Icon(Icons.send),
+                  ),
+                  TextButton(onPressed: _ping, child: const Text('PING')),
+                  TextButton(
+                    onPressed: () => _session?.close(),
+                    child: const Text('Couper'),
+                  ),
+                ],
+              ),
+            const Divider(),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _log.length,
+                itemBuilder: (_, i) => Text(_log[i]),
+              ),
             ),
           ],
         ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
       ),
     );
   }
