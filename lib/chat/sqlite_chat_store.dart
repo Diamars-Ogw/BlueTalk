@@ -160,7 +160,7 @@ class SqliteChatStore implements ChatStore {
       'messages',
       where: 'contact_id = ?',
       whereArgs: [contactId],
-      orderBy: 'sent_at ASC',
+      orderBy: 'sent_at ASC, rowid ASC',
     );
     return rows.map(_messageFromRow).toList();
   }
@@ -171,8 +171,27 @@ class SqliteChatStore implements ChatStore {
       'messages',
       where: 'contact_id = ? AND outgoing = 1 AND status < ?',
       whereArgs: [contactId, MessageStatus.delivered.index],
-      orderBy: 'sent_at ASC',
+      orderBy: 'sent_at ASC, rowid ASC',
     );
     return rows.map(_messageFromRow).toList();
+  }
+
+  @override
+  Future<String?> setting(String key) async {
+    final rows = await _db.query(
+      'meta',
+      where: 'k = ?',
+      whereArgs: ['setting.$key'],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first['v'] as String;
+  }
+
+  @override
+  Future<void> saveSetting(String key, String value) async {
+    await _db.insert('meta', {
+      'k': 'setting.$key',
+      'v': value,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 }

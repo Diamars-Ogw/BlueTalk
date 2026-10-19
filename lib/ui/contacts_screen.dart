@@ -4,6 +4,7 @@ import '../app/app_controller.dart';
 import '../chat/models.dart';
 import 'chat_screen.dart';
 import 'devices_screen.dart';
+import 'theme.dart';
 
 class ContactsScreen extends StatefulWidget {
   const ContactsScreen(this.controller, {super.key});
@@ -39,7 +40,6 @@ class _ContactsScreenState extends State<ContactsScreen> {
       final ms = await store.messages(c.deviceId);
       if (ms.isNotEmpty) last[c.deviceId] = ms.last;
     }
-    // Les conversations les plus récentes en premier.
     contacts.sort((a, b) {
       final ta = last[a.deviceId]?.at;
       final tb = last[b.deviceId]?.at;
@@ -58,10 +58,24 @@ class _ContactsScreenState extends State<ContactsScreen> {
   @override
   Widget build(BuildContext context) {
     final c = widget.controller;
-    final scheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final colors = ChatColors.of(context);
+    final isDark = theme.brightness == Brightness.dark;
 
     return Scaffold(
-      appBar: AppBar(title: Text(c.identity?.name ?? 'BlueTalk')),
+      appBar: AppBar(
+        title: Text(c.identity?.name ?? 'BlueTalk'),
+        actions: [
+          IconButton(
+            tooltip: isDark ? 'Thème clair' : 'Thème sombre',
+            icon: Icon(
+              isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+            ),
+            onPressed: () =>
+                c.setThemeMode(isDark ? ThemeMode.light : ThemeMode.dark),
+          ),
+        ],
+      ),
       body: Column(
         children: [
           SwitchListTile(
@@ -79,24 +93,30 @@ class _ContactsScreenState extends State<ContactsScreen> {
           if (c.lastError != null)
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-              child: Text(c.lastError!, style: TextStyle(color: scheme.error)),
+              child: Text(
+                c.lastError!,
+                style: TextStyle(color: theme.colorScheme.error),
+              ),
             ),
-          const Divider(height: 1),
+          const Divider(),
           Expanded(
             child: _contacts.isEmpty
-                ? const Center(
+                ? Center(
                     child: Padding(
-                      padding: EdgeInsets.all(24),
+                      padding: const EdgeInsets.all(32),
                       child: Text(
                         'Aucun contact pour l\'instant.\n\n'
                         'Sur un téléphone, active « Attendre une connexion ». '
                         'Sur l\'autre, touche « Se connecter ».',
                         textAlign: TextAlign.center,
+                        style: TextStyle(color: colors.subtleText),
                       ),
                     ),
                   )
-                : ListView.builder(
+                : ListView.separated(
                     itemCount: _contacts.length,
+                    separatorBuilder: (_, _) =>
+                        const Divider(indent: 72, endIndent: 0),
                     itemBuilder: (context, i) {
                       final k = _contacts[i];
                       final m = _last[k.deviceId];
@@ -105,22 +125,59 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           : String.fromCharCode(k.name.runes.first)
                                 .toUpperCase();
                       return ListTile(
-                        leading: CircleAvatar(child: Text(initial)),
-                        title: Text(k.name),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 4,
+                        ),
+                        leading: CircleAvatar(
+                          radius: 24,
+                          backgroundColor: theme.colorScheme.primary.withValues(
+                            alpha: 0.18,
+                          ),
+                          foregroundColor: theme.colorScheme.primary,
+                          child: Text(
+                            initial,
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        title: Text(
+                          k.name,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
                         subtitle: Text(
                           m == null
                               ? 'Nouveau contact'
                               : '${m.outgoing ? 'Toi : ' : ''}${m.text}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: colors.subtleText),
                         ),
-                        trailing: c.isConnected(k.deviceId)
-                            ? const Icon(
-                                Icons.circle,
-                                size: 12,
-                                color: Colors.green,
-                              )
-                            : null,
+                        trailing: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            if (m != null)
+                              Text(
+                                TimeOfDay.fromDateTime(m.at).format(context),
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: colors.subtleText,
+                                ),
+                              ),
+                            if (c.isConnected(k.deviceId))
+                              Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Icon(
+                                  Icons.circle,
+                                  size: 10,
+                                  color: theme.colorScheme.primary,
+                                ),
+                              ),
+                          ],
+                        ),
                         onTap: () => Navigator.of(context).push(
                           MaterialPageRoute<void>(
                             builder: (_) => ChatScreen(c, k),

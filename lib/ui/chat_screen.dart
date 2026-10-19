@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app/app_controller.dart';
 import '../chat/models.dart';
+import 'theme.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen(this.controller, this.contact, {super.key});
@@ -44,14 +45,16 @@ class _ChatScreenState extends State<ChatScreen> {
     await widget.controller.sendText(widget.contact.deviceId, text);
   }
 
-  Widget _statusIcon(MessageStatus s, Color color) {
-    final icon = switch (s) {
-      MessageStatus.pending => Icons.schedule,
-      MessageStatus.sent => Icons.done,
-      MessageStatus.delivered => Icons.done_all,
-      MessageStatus.received => Icons.done_all,
-    };
-    return Icon(icon, size: 14, color: color);
+  Widget _statusIcon(MessageStatus s, ChatColors colors) {
+    switch (s) {
+      case MessageStatus.pending:
+        return Icon(Icons.schedule, size: 14, color: colors.subtleText);
+      case MessageStatus.sent:
+        return Icon(Icons.done, size: 15, color: colors.subtleText);
+      case MessageStatus.delivered:
+      case MessageStatus.received:
+        return Icon(Icons.done_all, size: 15, color: colors.tick);
+    }
   }
 
   @override
@@ -59,17 +62,23 @@ class _ChatScreenState extends State<ChatScreen> {
     final c = widget.controller;
     final id = widget.contact.deviceId;
     final connected = c.isConnected(id);
+    final colors = ChatColors.of(context);
     final scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
+      backgroundColor: colors.chatBackground,
       appBar: AppBar(
+        titleSpacing: 0,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(widget.contact.name),
+            Text(
+              widget.contact.name,
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+            ),
             Text(
               connected ? 'connecté' : 'hors connexion',
-              style: Theme.of(context).textTheme.bodySmall,
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w400),
             ),
           ],
         ),
@@ -77,7 +86,12 @@ class _ChatScreenState extends State<ChatScreen> {
           if (connected)
             TextButton(
               onPressed: () => c.disconnect(id),
-              child: const Text('Couper'),
+              child: Text(
+                'Couper',
+                style: TextStyle(
+                  color: Theme.of(context).appBarTheme.foregroundColor,
+                ),
+              ),
             ),
         ],
       ),
@@ -86,25 +100,27 @@ class _ChatScreenState extends State<ChatScreen> {
           if (!connected)
             Container(
               width: double.infinity,
-              color: scheme.surfaceContainerHighest,
-              padding: const EdgeInsets.all(8),
-              child: const Text(
+              margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: colors.receivedBubble,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
                 'Hors connexion. Tes messages restent en attente et partent '
-                'à la prochaine connexion.',
+                'dès que vous êtes de nouveau connectés.',
                 textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12.5, color: colors.subtleText),
               ),
             ),
           Expanded(
             child: ListView.builder(
               reverse: true,
-              padding: const EdgeInsets.all(8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
               itemCount: _messages.length,
               itemBuilder: (context, i) {
                 final m = _messages[_messages.length - 1 - i];
                 final mine = m.outgoing;
-                final textColor = mine
-                    ? scheme.onPrimaryContainer
-                    : scheme.onSurface;
                 return Align(
                   alignment: mine
                       ? Alignment.centerRight
@@ -116,26 +132,43 @@ class _ChatScreenState extends State<ChatScreen> {
                       maxWidth: MediaQuery.of(context).size.width * 0.78,
                     ),
                     decoration: BoxDecoration(
-                      color: mine
-                          ? scheme.primaryContainer
-                          : scheme.surfaceContainerHighest,
-                      borderRadius: BorderRadius.circular(8),
+                      color: mine ? colors.sentBubble : colors.receivedBubble,
+                      borderRadius: BorderRadius.only(
+                        topLeft: const Radius.circular(10),
+                        topRight: const Radius.circular(10),
+                        bottomLeft: Radius.circular(mine ? 10 : 2),
+                        bottomRight: Radius.circular(mine ? 2 : 10),
+                      ),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(m.text, style: TextStyle(color: textColor)),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                            m.text,
+                            style: TextStyle(
+                              fontSize: 16,
+                              height: 1.25,
+                              color: colors.text,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 2),
                         Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Text(
                               TimeOfDay.fromDateTime(m.at).format(context),
-                              style: TextStyle(fontSize: 11, color: textColor),
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: colors.subtleText,
+                              ),
                             ),
                             if (mine) ...[
                               const SizedBox(width: 4),
-                              _statusIcon(m.status, textColor),
+                              _statusIcon(m.status, colors),
                             ],
                           ],
                         ),
@@ -147,24 +180,46 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           SafeArea(
+            top: false,
             child: Padding(
               padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
               child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Expanded(
                     child: TextField(
                       controller: _input,
                       minLines: 1,
-                      maxLines: 4,
+                      maxLines: 5,
                       textCapitalization: TextCapitalization.sentences,
-                      decoration: const InputDecoration(
+                      style: TextStyle(color: colors.text),
+                      decoration: InputDecoration(
                         hintText: 'Message',
-                        border: OutlineInputBorder(),
+                        hintStyle: TextStyle(color: colors.subtleText),
+                        filled: true,
+                        fillColor: colors.inputFill,
                         isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: BorderSide.none,
+                        ),
                       ),
                     ),
                   ),
-                  IconButton(onPressed: _send, icon: const Icon(Icons.send)),
+                  const SizedBox(width: 6),
+                  IconButton.filled(
+                    onPressed: _send,
+                    style: IconButton.styleFrom(
+                      backgroundColor: scheme.primary,
+                      foregroundColor: scheme.onPrimary,
+                      minimumSize: const Size(48, 48),
+                    ),
+                    icon: const Icon(Icons.send),
+                  ),
                 ],
               ),
             ),

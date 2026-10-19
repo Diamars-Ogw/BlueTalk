@@ -105,7 +105,7 @@ class ChatLink {
       contactId: from,
       outgoing: false,
       text: json['text'] as String,
-      at: DateTime.fromMillisecondsSinceEpoch(json['ts'] as int),
+      at: DateTime.now(),
       status: MessageStatus.received,
     );
     // Doublon possible (renvoi après une coupure) : ignoré par le stockage,

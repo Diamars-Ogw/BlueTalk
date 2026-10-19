@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 
 import '../bluetooth/bluetooth_bridge.dart';
 import '../chat/chat_link.dart';
@@ -10,17 +10,25 @@ import '../chat/sqlite_chat_store.dart';
 
 /// Relie la base, le Bluetooth et les connexions actives.
 class AppController extends ChangeNotifier {
-  AppController._(this.store, this.identity) {
+  AppController._(this.store, this.identity, this.themeMode) {
     _storeSub = store.changes.listen((_) => notifyListeners());
   }
 
   static Future<AppController> start() async {
     final store = await SqliteChatStore.open();
-    return AppController._(store, await store.loadIdentity());
+    final identity = await store.loadIdentity();
+    final saved = await store.setting('theme');
+    final mode = switch (saved) {
+      'light' => ThemeMode.light,
+      'dark' => ThemeMode.dark,
+      _ => ThemeMode.system,
+    };
+    return AppController._(store, identity, mode);
   }
 
   final ChatStore store;
   Identity? identity;
+  ThemeMode themeMode;
   String? lastError;
 
   final BluetoothBridge _bt = BluetoothBridge.instance;
@@ -39,6 +47,19 @@ class AppController extends ChangeNotifier {
     await store.saveIdentity(id);
     identity = id;
     notifyListeners();
+  }
+
+  Future<void> setThemeMode(ThemeMode mode) async {
+    themeMode = mode;
+    notifyListeners();
+    await store.saveSetting(
+      'theme',
+      mode == ThemeMode.dark
+          ? 'dark'
+          : mode == ThemeMode.light
+          ? 'light'
+          : 'system',
+    );
   }
 
   void _fail(String message) {

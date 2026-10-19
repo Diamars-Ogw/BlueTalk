@@ -25,6 +25,9 @@ abstract interface class ChatStore {
 
   /// Les messages sortants à (re)livrer : en attente, ou envoyés sans accusé.
   Future<List<ChatMessage>> pendingFor(String contactId);
+
+  Future<String?> setting(String key);
+  Future<void> saveSetting(String key, String value);
 }
 
 /// Version en mémoire, utilisée par les tests sur PC.
@@ -87,4 +90,14 @@ class MemoryChatStore implements ChatStore {
             (m) => m.outgoing && m.status.index < MessageStatus.delivered.index,
           )
           .toList();
+
+  final Map<String, String> _settings = {};
+
+  @override
+  Future<String?> setting(String key) async => _settings[key];
+
+  @override
+  Future<void> saveSetting(String key, String value) async {
+    _settings[key] = value;
+  }
 }
