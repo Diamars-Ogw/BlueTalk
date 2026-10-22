@@ -10,6 +10,9 @@ abstract interface class ChatStore {
   Future<Identity?> loadIdentity();
   Future<void> saveIdentity(Identity identity);
 
+  Future<String?> setting(String key);
+  Future<void> saveSetting(String key, String value);
+
   Future<Contact?> contact(String deviceId);
   Future<List<Contact>> contacts();
   Future<void> upsertContact(Contact contact);
@@ -17,23 +20,30 @@ abstract interface class ChatStore {
   /// Ajoute un message. Renvoie false s'il existe déjà (même identifiant).
   Future<bool> addMessage(ChatMessage message);
 
+  Future<ChatMessage?> message(String messageId);
+
   /// Fait avancer le statut d'un message sortant. Ne recule jamais.
   Future<void> setStatus(String messageId, MessageStatus status);
+
+  /// Met à jour un message entrant (réception d'un fichier terminée).
+  Future<void> setIncomingState(
+    String messageId,
+    MessageStatus status, {
+    String? filePath,
+  });
 
   /// Les messages d'une conversation, du plus ancien au plus récent.
   Future<List<ChatMessage>> messages(String contactId);
 
   /// Les messages sortants à (re)livrer : en attente, ou envoyés sans accusé.
   Future<List<ChatMessage>> pendingFor(String contactId);
-
-  Future<String?> setting(String key);
-  Future<void> saveSetting(String key, String value);
 }
 
 /// Version en mémoire, utilisée par les tests sur PC.
 class MemoryChatStore implements ChatStore {
   final StreamController<void> _changes = StreamController<void>.broadcast();
   Identity? _identity;
+  final Map<String, String> _settings = {};
   final Map<String, Contact> _contacts = {};
   final Map<String, ChatMessage> _messages = {};
 
@@ -47,6 +57,14 @@ class MemoryChatStore implements ChatStore {
   Future<void> saveIdentity(Identity identity) async {
     _identity = identity;
     _changes.add(null);
+  }
+
+  @override
+  Future<String?> setting(String key) async => _settings[key];
+
+  @override
+  Future<void> saveSetting(String key, String value) async {
+    _settings[key] = value;
   }
 
   @override
@@ -71,10 +89,25 @@ class MemoryChatStore implements ChatStore {
   }
 
   @override
+  Future<ChatMessage?> message(String messageId) async => _messages[messageId];
+
+  @override
   Future<void> setStatus(String messageId, MessageStatus status) async {
     final m = _messages[messageId];
     if (m == null || !m.outgoing || status.index <= m.status.index) return;
     _messages[messageId] = m.withStatus(status);
+    _changes.add(null);
+  }
+
+  @override
+  Future<void> setIncomingState(
+    String messageId,
+    MessageStatus status, {
+    String? filePath,
+  }) async {
+    final m = _messages[messageId];
+    if (m == null || m.outgoing) return;
+    _messages[messageId] = m.copyWith(status: status, filePath: filePath);
     _changes.add(null);
   }
 
@@ -90,14 +123,4 @@ class MemoryChatStore implements ChatStore {
             (m) => m.outgoing && m.status.index < MessageStatus.delivered.index,
           )
           .toList();
-
-  final Map<String, String> _settings = {};
-
-  @override
-  Future<String?> setting(String key) async => _settings[key];
-
-  @override
-  Future<void> saveSetting(String key, String value) async {
-    _settings[key] = value;
-  }
 }

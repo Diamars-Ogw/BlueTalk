@@ -74,21 +74,26 @@ class _ContactsScreenState extends State<ContactsScreen> {
             onPressed: () =>
                 c.setThemeMode(isDark ? ThemeMode.light : ThemeMode.dark),
           ),
+          /*IconButton(
+            tooltip: 'Test Bluetooth sans association',
+            icon: const Icon(Icons.radar),
+            onPressed: () => Navigator.of(
+              context,
+            ).push(MaterialPageRoute<void>(builder: (_) => BleTestScreen(c))),
+          ),*/
         ],
       ),
       body: Column(
         children: [
           SwitchListTile(
-            title: const Text('Attendre une connexion'),
+            title: const Text('Visible à proximité'),
             subtitle: Text(
-              c.hasActiveConnection
-                  ? 'Connecté'
-                  : c.listening
-                  ? 'En attente d\'un autre téléphone…'
-                  : 'Désactivé',
+              c.visible
+                  ? 'Les autres utilisateurs de BlueTalk peuvent te trouver'
+                  : 'Invisible : personne ne peut te trouver',
             ),
-            value: c.listening,
-            onChanged: (v) => v ? c.startListening() : c.stopListening(),
+            value: c.visible,
+            onChanged: c.setVisible,
           ),
           if (c.lastError != null)
             Padding(
@@ -106,8 +111,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
                       padding: const EdgeInsets.all(32),
                       child: Text(
                         'Aucun contact pour l\'instant.\n\n'
-                        'Sur un téléphone, active « Attendre une connexion ». '
-                        'Sur l\'autre, touche « Se connecter ».',
+                        'Appuie sur « Rechercher » pour trouver les '
+                        'utilisateurs de BlueTalk à proximité.',
                         textAlign: TextAlign.center,
                         style: TextStyle(color: colors.subtleText),
                       ),
@@ -148,9 +153,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
                           style: const TextStyle(fontWeight: FontWeight.w600),
                         ),
                         subtitle: Text(
-                          m == null
-                              ? 'Nouveau contact'
-                              : '${m.outgoing ? 'Toi : ' : ''}${m.text}',
+                          m == null ? 'Nouveau contact' : _preview(m),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(color: colors.subtleText),
@@ -193,8 +196,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
         onPressed: () => Navigator.of(context)
             .push(MaterialPageRoute<void>(builder: (_) => DevicesScreen(c))),
         icon: const Icon(Icons.bluetooth_searching),
-        label: const Text('Se connecter'),
+        label: const Text('Rechercher'),
       ),
     );
+  }
+}
+
+String _preview(ChatMessage m) {
+  final who = m.outgoing ? 'Toi : ' : '';
+  switch (m.kind) {
+    case MessageKind.text:
+      return '$who${m.text}';
+    case MessageKind.image:
+      return '${who}Image';
+    case MessageKind.file:
+      return '$who${m.fileName ?? 'Fichier'}';
   }
 }

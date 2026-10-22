@@ -24,6 +24,7 @@ abstract final class FrameType {
   static const int fileChunk = 11;
   static const int fileEnd = 12;
   static const int fileAbort = 13;
+  static const int fileAccept = 14;
 
   /// Octets bruts libres, utile pour le mode test.
   static const int raw = 20;
@@ -72,7 +73,8 @@ Uint8List encodeFrame(Frame frame) {
   }
   if (frame.payload.length > maxPayloadSize) {
     throw ProtocolException(
-        'Contenu trop grand : ${frame.payload.length} octets');
+      'Contenu trop grand : ${frame.payload.length} octets',
+    );
   }
   final out = Uint8List(headerSize + frame.payload.length);
   final header = ByteData.sublistView(out);

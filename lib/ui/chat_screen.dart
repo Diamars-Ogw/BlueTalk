@@ -1,8 +1,18 @@
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:open_filex/open_filex.dart';
 
 import '../app/app_controller.dart';
 import '../chat/models.dart';
 import 'theme.dart';
+
+String formatSize(int bytes) {
+  if (bytes < 1024) return '$bytes o';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} Ko';
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} Mo';
+}
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen(this.controller, this.contact, {super.key});
@@ -45,6 +55,67 @@ class _ChatScreenState extends State<ChatScreen> {
     await widget.controller.sendText(widget.contact.deviceId, text);
   }
 
+  // ---------- Pièces jointes ----------
+
+  Future<void> _showAttachMenu() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.image_outlined),
+              title: const Text('Image'),
+              onTap: () => Navigator.pop(sheet, 'image'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_outlined),
+              title: const Text('Document'),
+              onTap: () => Navigator.pop(sheet, 'file'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null) return;
+    await _pick(image: choice == 'image');
+  }
+
+  Future<void> _pick({required bool image}) async {
+    final result = await FilePicker.platform.pickFiles(
+      type: image ? FileType.image : FileType.any,
+    );
+    final f = result?.files.single;
+    final path = f?.path;
+    if (f == null || path == null) return;
+    final error = await widget.controller.sendFile(
+      widget.contact.deviceId,
+      sourcePath: path,
+      name: f.name,
+      image: image,
+    );
+    if (error != null && mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error)));
+    }
+  }
+
+  Future<void> _open(String path) async {
+    final r = await OpenFilex.open(path);
+    if (r.type != ResultType.done && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Impossible d\'ouvrir ce fichier avec les applications installées.',
+          ),
+        ),
+      );
+    }
+  }
+
+  // ---------- Affichage des messages ----------
+
   Widget _statusIcon(MessageStatus s, ChatColors colors) {
     switch (s) {
       case MessageStatus.pending:
@@ -54,6 +125,137 @@ class _ChatScreenState extends State<ChatScreen> {
       case MessageStatus.delivered:
       case MessageStatus.received:
         return Icon(Icons.done_all, size: 15, color: colors.tick);
+      case MessageStatus.receiving:
+        return Icon(Icons.downloading, size: 14, color: colors.subtleText);
+    }
+  }
+
+  Widget? _transferInfo(ChatMessage m, ChatColors colors) {
+    final p = widget.controller.progress[m.id];
+    if (p != null) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 6),
+          LinearProgressIndicator(
+            value: p,
+            minHeight: 4,
+            backgroundColor: colors.subtleText.withValues(alpha: 0.25),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '${(p * 100).round()} %',
+            style: TextStyle(fontSize: 11, color: colors.subtleText),
+          ),
+        ],
+      );
+    }
+    if (!m.outgoing && m.status == MessageStatus.receiving) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 6),
+        child: Text(
+          'Réception interrompue, en attente du renvoi',
+          style: TextStyle(fontSize: 11, color: colors.subtleText),
+        ),
+      );
+    }
+    return null;
+  }
+
+  Widget _imagePlaceholder(ChatColors colors, IconData icon) => Container(
+    width: 230,
+    height: 150,
+    color: colors.subtleText.withValues(alpha: 0.15),
+    child: Icon(icon, size: 40, color: colors.subtleText),
+  );
+
+  Widget _imageBody(ChatMessage m, ChatColors colors) {
+    final path = m.filePath;
+    final ready =
+        path != null && (m.outgoing || m.status == MessageStatus.received);
+    final info = _transferInfo(m, colors);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        GestureDetector(
+          onTap: ready ? () => _open(path!) : null,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: ready
+                ? Image.file(
+                    File(path!),
+                    width: 230,
+                    cacheWidth: 690,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) =>
+                        _imagePlaceholder(colors, Icons.broken_image_outlined),
+                  )
+                : _imagePlaceholder(colors, Icons.image_outlined),
+          ),
+        ),
+        if (info != null) info,
+      ],
+    );
+  }
+
+  Widget _fileBody(ChatMessage m, ChatColors colors) {
+    final path = m.filePath;
+    final ready =
+        path != null && (m.outgoing || m.status == MessageStatus.received);
+    final info = _transferInfo(m, colors);
+    return InkWell(
+      onTap: ready ? () => _open(path!) : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.insert_drive_file_outlined,
+                size: 32,
+                color: colors.subtleText,
+              ),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      m.fileName ?? 'Fichier',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 15, color: colors.text),
+                    ),
+                    Text(
+                      formatSize(m.fileSize ?? 0),
+                      style: TextStyle(fontSize: 12, color: colors.subtleText),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (info != null) info,
+        ],
+      ),
+    );
+  }
+
+  Widget _body(ChatMessage m, ChatColors colors) {
+    switch (m.kind) {
+      case MessageKind.text:
+        return Text(
+          m.text,
+          style: TextStyle(fontSize: 16, height: 1.25, color: colors.text),
+        );
+      case MessageKind.image:
+        return _imageBody(m, colors);
+      case MessageKind.file:
+        return _fileBody(m, colors);
     }
   }
 
@@ -107,8 +309,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Text(
-                'Hors connexion. Tes messages restent en attente et partent '
-                'dès que vous êtes de nouveau connectés.',
+                'Hors connexion. Tes messages et tes fichiers restent en '
+                'attente et partent dès que vous êtes de nouveau connectés.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12.5, color: colors.subtleText),
               ),
@@ -146,14 +348,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       children: [
                         Align(
                           alignment: Alignment.centerLeft,
-                          child: Text(
-                            m.text,
-                            style: TextStyle(
-                              fontSize: 16,
-                              height: 1.25,
-                              color: colors.text,
-                            ),
-                          ),
+                          child: _body(m, colors),
                         ),
                         const SizedBox(height: 2),
                         Row(
@@ -182,10 +377,14 @@ class _ChatScreenState extends State<ChatScreen> {
           SafeArea(
             top: false,
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+              padding: const EdgeInsets.fromLTRB(4, 4, 8, 8),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
+                  IconButton(
+                    onPressed: _showAttachMenu,
+                    icon: Icon(Icons.attach_file, color: colors.subtleText),
+                  ),
                   Expanded(
                     child: TextField(
                       controller: _input,

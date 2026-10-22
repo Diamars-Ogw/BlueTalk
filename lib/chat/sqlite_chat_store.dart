@@ -15,7 +15,7 @@ class SqliteChatStore implements ChatStore {
     final file = path ?? '${await getDatabasesPath()}/bluetalk.db';
     final db = await openDatabase(
       file,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute(
           'CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)',
@@ -34,11 +34,27 @@ class SqliteChatStore implements ChatStore {
           'outgoing INTEGER NOT NULL, '
           'body TEXT NOT NULL, '
           'sent_at INTEGER NOT NULL, '
-          'status INTEGER NOT NULL)',
+          'status INTEGER NOT NULL, '
+          'kind INTEGER NOT NULL DEFAULT 0, '
+          'file_name TEXT, '
+          'file_size INTEGER, '
+          'file_path TEXT, '
+          'mime TEXT)',
         );
         await db.execute(
           'CREATE INDEX idx_messages_contact ON messages (contact_id, sent_at)',
         );
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(
+            'ALTER TABLE messages ADD COLUMN kind INTEGER NOT NULL DEFAULT 0',
+          );
+          await db.execute('ALTER TABLE messages ADD COLUMN file_name TEXT');
+          await db.execute('ALTER TABLE messages ADD COLUMN file_size INTEGER');
+          await db.execute('ALTER TABLE messages ADD COLUMN file_path TEXT');
+          await db.execute('ALTER TABLE messages ADD COLUMN mime TEXT');
+        }
       },
     );
     return SqliteChatStore._(db);
@@ -46,6 +62,8 @@ class SqliteChatStore implements ChatStore {
 
   @override
   Stream<void> get changes => _changes.stream;
+
+  // ---------- Identité et réglages ----------
 
   @override
   Future<Identity?> loadIdentity() async {
@@ -71,6 +89,27 @@ class SqliteChatStore implements ChatStore {
     await batch.commit(noResult: true);
     _changes.add(null);
   }
+
+  @override
+  Future<String?> setting(String key) async {
+    final rows = await _db.query(
+      'meta',
+      where: 'k = ?',
+      whereArgs: ['setting.$key'],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : rows.first['v'] as String;
+  }
+
+  @override
+  Future<void> saveSetting(String key, String value) async {
+    await _db.insert('meta', {
+      'k': 'setting.$key',
+      'v': value,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  // ---------- Contacts ----------
 
   Contact _contactFromRow(Map<String, Object?> r) => Contact(
     deviceId: r['device_id'] as String,
@@ -109,6 +148,8 @@ class SqliteChatStore implements ChatStore {
     _changes.add(null);
   }
 
+  // ---------- Messages ----------
+
   ChatMessage _messageFromRow(Map<String, Object?> r) => ChatMessage(
     id: r['id'] as String,
     contactId: r['contact_id'] as String,
@@ -116,7 +157,26 @@ class SqliteChatStore implements ChatStore {
     text: r['body'] as String,
     at: DateTime.fromMillisecondsSinceEpoch(r['sent_at'] as int),
     status: MessageStatus.values[r['status'] as int],
+    kind: MessageKind.values[(r['kind'] as int?) ?? 0],
+    fileName: r['file_name'] as String?,
+    fileSize: r['file_size'] as int?,
+    filePath: r['file_path'] as String?,
+    mime: r['mime'] as String?,
   );
+
+  Map<String, Object?> _messageToRow(ChatMessage m) => {
+    'id': m.id,
+    'contact_id': m.contactId,
+    'outgoing': m.outgoing ? 1 : 0,
+    'body': m.text,
+    'sent_at': m.at.millisecondsSinceEpoch,
+    'status': m.status.index,
+    'kind': m.kind.index,
+    'file_name': m.fileName,
+    'file_size': m.fileSize,
+    'file_path': m.filePath,
+    'mime': m.mime,
+  };
 
   @override
   Future<bool> addMessage(ChatMessage m) async {
@@ -129,18 +189,22 @@ class SqliteChatStore implements ChatStore {
         limit: 1,
       );
       if (exists.isNotEmpty) return false;
-      await txn.insert('messages', {
-        'id': m.id,
-        'contact_id': m.contactId,
-        'outgoing': m.outgoing ? 1 : 0,
-        'body': m.text,
-        'sent_at': m.at.millisecondsSinceEpoch,
-        'status': m.status.index,
-      });
+      await txn.insert('messages', _messageToRow(m));
       return true;
     });
     if (added) _changes.add(null);
     return added;
+  }
+
+  @override
+  Future<ChatMessage?> message(String messageId) async {
+    final rows = await _db.query(
+      'messages',
+      where: 'id = ?',
+      whereArgs: [messageId],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : _messageFromRow(rows.first);
   }
 
   @override
@@ -152,6 +216,21 @@ class SqliteChatStore implements ChatStore {
       whereArgs: [messageId, status.index],
     );
     if (n > 0) _changes.add(null);
+  }
+
+  @override
+  Future<void> setIncomingState(
+    String messageId,
+    MessageStatus status, {
+    String? filePath,
+  }) async {
+    await _db.update(
+      'messages',
+      {'status': status.index, if (filePath != null) 'file_path': filePath},
+      where: 'id = ? AND outgoing = 0',
+      whereArgs: [messageId],
+    );
+    _changes.add(null);
   }
 
   @override
@@ -174,24 +253,5 @@ class SqliteChatStore implements ChatStore {
       orderBy: 'sent_at ASC, rowid ASC',
     );
     return rows.map(_messageFromRow).toList();
-  }
-
-  @override
-  Future<String?> setting(String key) async {
-    final rows = await _db.query(
-      'meta',
-      where: 'k = ?',
-      whereArgs: ['setting.$key'],
-      limit: 1,
-    );
-    return rows.isEmpty ? null : rows.first['v'] as String;
-  }
-
-  @override
-  Future<void> saveSetting(String key, String value) async {
-    await _db.insert('meta', {
-      'k': 'setting.$key',
-      'v': value,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 }

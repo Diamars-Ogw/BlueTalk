@@ -35,6 +35,7 @@ class MainActivity : FlutterActivity() {
     private var serverSocket: BluetoothServerSocket? = null
     private var socket: BluetoothSocket? = null
     private var output: OutputStream? = null
+    private var ble: BleBridge? = null
 
     private val adapter: BluetoothAdapter?
         get() = (getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -42,6 +43,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
+        ble = BleBridge(this, messenger)
 
         EventChannel(messenger, "bluetalk/bt/events").setStreamHandler(
             object : EventChannel.StreamHandler {
@@ -92,6 +94,7 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        ble?.onRequestPermissionsResult(requestCode, grantResults)
         if (requestCode == permissionCode) {
             val granted = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
@@ -281,6 +284,7 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         closeConnection()
         stopListening()
+        ble?.shutdown()
         super.onDestroy()
     }
 }

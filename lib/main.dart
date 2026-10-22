@@ -5,10 +5,13 @@ import 'ui/contacts_screen.dart';
 import 'ui/name_screen.dart';
 import 'ui/theme.dart';
 
+import 'dart:async';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final controller = await AppController.start();
   runApp(BlueTalkApp(controller));
+  unawaited(controller.restoreVisibility());
 }
 
 class BlueTalkApp extends StatelessWidget {
