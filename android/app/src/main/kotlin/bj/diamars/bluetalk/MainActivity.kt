@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -36,6 +37,9 @@ class MainActivity : FlutterActivity() {
     private var socket: BluetoothSocket? = null
     private var output: OutputStream? = null
     private var ble: BleBridge? = null
+    private var audio: AudioBridge? = null
+    private var pendingNotifPermission: MethodChannel.Result? = null
+    private val notifPermissionCode = 4344
 
     private val adapter: BluetoothAdapter?
         get() = (getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -44,6 +48,7 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
         ble = BleBridge(this, messenger)
+        audio = AudioBridge(this, messenger)
 
         EventChannel(messenger, "bluetalk/bt/events").setStreamHandler(
             object : EventChannel.StreamHandler {
@@ -55,6 +60,43 @@ class MainActivity : FlutterActivity() {
                 }
             }
         )
+
+        // Présence en arrière-plan : service de premier plan, notifications,
+        // et bouton Retour qui met l'application de côté au lieu de la fermer.
+        MethodChannel(messenger, "bluetalk/service").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    try {
+                        val i = Intent(this, LinkService::class.java)
+                            .putExtra("text", call.argument<String>("text") ?: "")
+                        startForegroundService(i)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+                "stop" -> {
+                    stopService(Intent(this, LinkService::class.java))
+                    result.success(null)
+                }
+                "notify" -> {
+                    Notifier.ensureChannels(this)
+                    Notifier.message(
+                        this,
+                        call.argument<Int>("id") ?: 0,
+                        call.argument<String>("title") ?: "BlueTalk",
+                        call.argument<String>("body") ?: ""
+                    )
+                    result.success(null)
+                }
+                "moveToBack" -> {
+                    moveTaskToBack(true)
+                    result.success(null)
+                }
+                "ensureNotifications" -> ensureNotifications(result)
+                else -> result.notImplemented()
+            }
+        }
 
         MethodChannel(messenger, "bluetalk/bt").setMethodCallHandler { call, result ->
             when (call.method) {
@@ -69,6 +111,19 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    private fun ensureNotifications(result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            result.success(true)
+            return
+        }
+        pendingNotifPermission?.success(false)
+        pendingNotifPermission = result
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), notifPermissionCode)
     }
 
     // ---------- Permissions ----------
@@ -95,6 +150,14 @@ class MainActivity : FlutterActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         ble?.onRequestPermissionsResult(requestCode, grantResults)
+        audio?.onRequestPermissionsResult(requestCode, grantResults)
+        if (requestCode == notifPermissionCode) {
+            pendingNotifPermission?.success(
+                grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            )
+            pendingNotifPermission = null
+        }
         if (requestCode == permissionCode) {
             val granted = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
@@ -285,6 +348,7 @@ class MainActivity : FlutterActivity() {
         closeConnection()
         stopListening()
         ble?.shutdown()
+        audio?.shutdown()
         super.onDestroy()
     }
 }

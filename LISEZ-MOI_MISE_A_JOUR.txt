@@ -1,0 +1,53 @@
+BlueTalk — mise à jour 2 : fichiers fiables, administration, vocaux, plus de connexions
+=====================================================================================
+
+INSTALLER
+  1. Copie le contenu de ce zip par-dessus ton projet (accepte de remplacer).
+  2. Dans le dossier du projet :
+         flutter clean
+         flutter pub get
+         flutter run
+     Aucune nouvelle dépendance Dart. Ta base est migrée toute seule (version 3 -> 4) :
+     contacts, groupes et discussions sont conservés.
+  3. Accepte les autorisations : Bluetooth, notifications et MICRO (pour les vocaux).
+  4. Sur CHAQUE téléphone, installe cette nouvelle version (les anciennes et les nouvelles
+     ne se comprennent pas pour les fichiers).
+
+CE QUI A CHANGÉ
+
+  Fichiers (le problème de tes captures)
+   - Les gros fichiers partent UN À LA FOIS depuis un téléphone (avant : vers deux membres
+     en même temps, ce qui saturait la radio et coupait une liaison).
+   - Un transfert interrompu REPREND où il s'était arrêté (avant : depuis le début).
+   - Plus de recherche Bluetooth ni de PING pendant un transfert (le scan ralentit les liaisons).
+   - Relais des fichiers : un membre qui a reçu le fichier le transmet aux autres.
+   - L'affichage de la progression ne ralentit plus le transfert.
+
+  Administration du groupe (écran « Infos du groupe »)
+   - Créateur : nomme/retire des administrateurs, supprime le groupe pour tous.
+   - Créateur et administrateurs : renomment, ajoutent, retirent des membres, mode annonces.
+
+  Messages vocaux
+   - Maintiens le micro (à droite du champ de texte), relâche pour envoyer, glisse à gauche
+     pour annuler. Disponible en discussion privée et en groupe.
+
+  Connexions
+   - Plafond porté à 15. La limite réelle est celle du téléphone : l'application la détecte
+     et l'affiche (« ce téléphone en accepte N au plus »).
+
+  Journal (icône insecte, en haut)
+   - Note chaque connexion, coupure (avec sa cause) et transfert.
+
+TEST À FAIRE
+  1. Groupe de 3 téléphones. Envoie une IMAGE puis une VIDÉO. Tous doivent la recevoir.
+     La barre de progression avance ; « 2/2 » apparaît à la fin.
+  2. Pendant un gros envoi, éloigne un téléphone 20 secondes puis rapproche-le : le fichier
+     doit reprendre (voir « reprise à … o » dans le Journal).
+  3. Envoie un vocal : maintiens le micro 3 secondes, relâche. Puis un autre et glisse à
+     gauche pour annuler.
+  4. Infos du groupe : nomme un administrateur, active le mode annonces, vérifie qu'un simple
+     membre ne peut plus écrire.
+
+SI UN FICHIER ÉCHOUE ENCORE
+  Ouvre le Journal (icône insecte) sur le téléphone qui envoie ET sur celui qui reçoit, touche
+  « Copier tout » et envoie-moi les deux textes. On y verra la cause exacte de la coupure.

@@ -26,6 +26,12 @@ abstract final class FrameType {
   static const int fileAbort = 13;
   static const int fileAccept = 14;
 
+  /// Groupes : description d'un groupe, message, reçu de livraison, départ.
+  static const int groupInfo = 30;
+  static const int groupText = 31;
+  static const int groupReceipt = 32;
+  static const int groupLeave = 33;
+
   /// Octets bruts libres, utile pour le mode test.
   static const int raw = 20;
 }

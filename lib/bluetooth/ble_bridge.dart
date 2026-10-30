@@ -38,7 +38,9 @@ class NearbyUser {
   final int rssi; // force du signal (plus proche de 0 = plus près)
 }
 
-/// Découverte par balises et canal L2CAP, via le code Kotlin.
+/// Découverte par balises et canaux L2CAP, via le code Kotlin. Plusieurs
+/// connexions peuvent être ouvertes en même temps : chacune a un numéro
+/// (cid), présent dans chaque évènement venant du code natif.
 class BleBridge {
   BleBridge._() {
     _eventChannel.receiveBroadcastStream().listen(
@@ -57,6 +59,9 @@ class BleBridge {
   final StreamController<BleTransport> _accepted =
       StreamController<BleTransport>.broadcast();
 
+  int _reqCounter = 0;
+  final Set<int> _waiting = {}; // demandes de connexion encore attendues
+
   Stream<Map<String, dynamic>> get events => _events.stream;
 
   /// Connexions entrantes : quelqu'un s'est connecté à nous.
@@ -69,12 +74,21 @@ class BleBridge {
 
   void _onEvent(dynamic raw) {
     final e = Map<String, dynamic>.from(raw as Map);
-    if (e['type'] == 'connected' && e['role'] == 'server') {
-      if (_accepted.hasListener) {
-        // Créé tout de suite : aucune donnée reçue juste après n'est perdue.
-        _accepted.add(BleTransport._(this, e));
-      } else {
-        unawaited(_call<void>('close').catchError((_) => null));
+    if (e['type'] == 'connected') {
+      if (e['role'] == 'server') {
+        if (_accepted.hasListener) {
+          // Créé tout de suite : aucune donnée reçue juste après n'est perdue.
+          _accepted.add(BleTransport._(this, e));
+        } else {
+          unawaited(
+            _call<void>('close', {'cid': e['cid']}).catchError((_) => null),
+          );
+        }
+      } else if (!_waiting.contains(e['req'])) {
+        // Une connexion que plus personne n'attend (délai dépassé) : on la ferme.
+        unawaited(
+          _call<void>('close', {'cid': e['cid']}).catchError((_) => null),
+        );
       }
     }
     _events.add(e);
@@ -106,11 +120,15 @@ class BleBridge {
 
   Future<void> stopScan() => _call<void>('stopScan');
 
+  /// Ouvre une connexion. Plusieurs peuvent être en cours : chaque demande
+  /// a un numéro, repris par la réponse du code natif.
   Future<BleTransport> connect(String address, int psm) async {
+    final req = ++_reqCounter;
+    _waiting.add(req);
     final c = Completer<BleTransport>();
     c.future.ignore();
     final sub = events.listen((e) {
-      if (c.isCompleted) return;
+      if (c.isCompleted || e['req'] != req) return;
       if (e['type'] == 'connected' && e['role'] == 'client') {
         c.complete(BleTransport._(this, e));
       } else if (e['type'] == 'error') {
@@ -120,23 +138,38 @@ class BleBridge {
       }
     });
     try {
-      await _call<void>('connect', {'address': address, 'psm': psm});
+      await _call<void>('connect', {
+        'address': address,
+        'psm': psm,
+        'req': req,
+      });
       return await c.future.timeout(const Duration(seconds: 20));
+    } on TimeoutException {
+      unawaited(_call<void>('cancelConnect', {'req': req}).catchError((_) {}));
+      throw BleException('Connexion impossible : délai dépassé');
     } finally {
+      _waiting.remove(req);
       await sub.cancel();
     }
   }
+
+  /// Coupe toutes les connexions.
+  Future<void> closeAll() => _call<void>('closeAll');
 }
 
 /// Le canal réel, utilisable par une [Session] comme les autres transports.
 class BleTransport implements Transport {
   BleTransport._(this._bridge, Map<String, dynamic> info)
-    : remoteName = info['name'] as String? ?? 'Appareil',
+    : cid = info['cid'] as int,
+      remoteName = info['name'] as String? ?? 'Appareil',
       remoteAddress = info['address'] as String? ?? '' {
     _sub = _bridge.events.listen(_onEvent);
   }
 
   final BleBridge _bridge;
+
+  /// Numéro de cette connexion côté Android.
+  final int cid;
   final String remoteName;
   final String remoteAddress;
 
@@ -149,6 +182,7 @@ class BleTransport implements Transport {
   Stream<Uint8List> get incoming => _in.stream;
 
   void _onEvent(Map<String, dynamic> e) {
+    if (e['cid'] != cid) return; // évènement d'une autre connexion
     switch (e['type']) {
       case 'data':
         if (!_in.isClosed) _in.add(e['bytes'] as Uint8List);
@@ -161,7 +195,7 @@ class BleTransport implements Transport {
   Future<void> send(Uint8List bytes) {
     if (_closed) return Future<void>.error(StateError('Canal fermé'));
     final run = _tail.then(
-      (_) => _bridge._call<void>('send', {'bytes': bytes}),
+      (_) => _bridge._call<void>('send', {'cid': cid, 'bytes': bytes}),
     );
     _tail = run.catchError((_) {});
     return run;
@@ -172,7 +206,7 @@ class BleTransport implements Transport {
     if (_closed) return;
     _finish();
     try {
-      await _bridge._call<void>('close');
+      await _bridge._call<void>('close', {'cid': cid});
     } catch (_) {}
   }
 

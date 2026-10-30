@@ -15,7 +15,7 @@ class SqliteChatStore implements ChatStore {
     final file = path ?? '${await getDatabasesPath()}/bluetalk.db';
     final db = await openDatabase(
       file,
-      version: 2,
+      version: 4,
       onCreate: (db, version) async {
         await db.execute(
           'CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)',
@@ -39,11 +39,15 @@ class SqliteChatStore implements ChatStore {
           'file_name TEXT, '
           'file_size INTEGER, '
           'file_path TEXT, '
-          'mime TEXT)',
+          'mime TEXT, '
+          'sender_id TEXT, '
+          'sender_name TEXT, '
+          'duration_ms INTEGER)',
         );
         await db.execute(
           'CREATE INDEX idx_messages_contact ON messages (contact_id, sent_at)',
         );
+        await _createGroupTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -55,9 +59,55 @@ class SqliteChatStore implements ChatStore {
           await db.execute('ALTER TABLE messages ADD COLUMN file_path TEXT');
           await db.execute('ALTER TABLE messages ADD COLUMN mime TEXT');
         }
+        if (oldVersion < 3) {
+          await db.execute('ALTER TABLE messages ADD COLUMN sender_id TEXT');
+          await db.execute('ALTER TABLE messages ADD COLUMN sender_name TEXT');
+          await _createGroupTables(db);
+        }
+        if (oldVersion < 4) {
+          await db.execute('ALTER TABLE messages ADD COLUMN duration_ms INTEGER');
+          // Les groupes créés avant cette version n'avaient pas ces réglages.
+          await db.execute("ALTER TABLE groups ADD COLUMN admins TEXT NOT NULL DEFAULT ''");
+          await db.execute('ALTER TABLE groups ADD COLUMN admins_only INTEGER NOT NULL DEFAULT 0');
+          await db.execute('ALTER TABLE groups ADD COLUMN closed INTEGER NOT NULL DEFAULT 0');
+          await db.execute('ALTER TABLE groups ADD COLUMN edited_by TEXT');
+        }
       },
     );
     return SqliteChatStore._(db);
+  }
+
+  static Future<void> _createGroupTables(Database db) async {
+    await db.execute(
+      'CREATE TABLE groups ('
+      'id TEXT PRIMARY KEY, '
+      'name TEXT NOT NULL, '
+      'creator_id TEXT NOT NULL, '
+      'version INTEGER NOT NULL, '
+      'created_at INTEGER NOT NULL, '
+      'active INTEGER NOT NULL DEFAULT 1, '
+      "admins TEXT NOT NULL DEFAULT '', "
+      'admins_only INTEGER NOT NULL DEFAULT 0, '
+      'closed INTEGER NOT NULL DEFAULT 0, '
+      'edited_by TEXT)',
+    );
+    await db.execute(
+      'CREATE TABLE group_members ('
+      'group_id TEXT NOT NULL, '
+      'device_id TEXT NOT NULL, '
+      'name TEXT NOT NULL, '
+      'PRIMARY KEY (group_id, device_id))',
+    );
+    await db.execute(
+      'CREATE TABLE deliveries ('
+      'message_id TEXT NOT NULL, '
+      'member_id TEXT NOT NULL, '
+      'state INTEGER NOT NULL DEFAULT 0, '
+      'PRIMARY KEY (message_id, member_id))',
+    );
+    await db.execute(
+      'CREATE INDEX idx_deliveries_member ON deliveries (member_id, state)',
+    );
   }
 
   @override
@@ -162,6 +212,9 @@ class SqliteChatStore implements ChatStore {
     fileSize: r['file_size'] as int?,
     filePath: r['file_path'] as String?,
     mime: r['mime'] as String?,
+    senderId: r['sender_id'] as String?,
+    senderName: r['sender_name'] as String?,
+    durationMs: r['duration_ms'] as int?,
   );
 
   Map<String, Object?> _messageToRow(ChatMessage m) => {
@@ -176,6 +229,9 @@ class SqliteChatStore implements ChatStore {
     'file_size': m.fileSize,
     'file_path': m.filePath,
     'mime': m.mime,
+    'sender_id': m.senderId,
+    'sender_name': m.senderName,
+    'duration_ms': m.durationMs,
   };
 
   @override
@@ -253,5 +309,200 @@ class SqliteChatStore implements ChatStore {
       orderBy: 'sent_at ASC, rowid ASC',
     );
     return rows.map(_messageFromRow).toList();
+  }
+
+  // ---------- Groupes ----------
+
+  Future<Group> _groupFromRow(Map<String, Object?> r) async {
+    final id = r['id'] as String;
+    final rows = await _db.query(
+      'group_members',
+      where: 'group_id = ?',
+      whereArgs: [id],
+      orderBy: 'name COLLATE NOCASE',
+    );
+    return Group(
+      id: id,
+      name: r['name'] as String,
+      creatorId: r['creator_id'] as String,
+      version: r['version'] as int,
+      createdAt: DateTime.fromMillisecondsSinceEpoch(r['created_at'] as int),
+      active: (r['active'] as int) == 1,
+      admins: ((r['admins'] as String?) ?? '')
+          .split(',')
+          .where((a) => a.isNotEmpty)
+          .toList(),
+      adminsOnlyPost: ((r['admins_only'] as int?) ?? 0) == 1,
+      closed: ((r['closed'] as int?) ?? 0) == 1,
+      editedBy: r['edited_by'] as String?,
+      members: [
+        for (final m in rows)
+          GroupMember(
+            deviceId: m['device_id'] as String,
+            name: m['name'] as String,
+          ),
+      ],
+    );
+  }
+
+  @override
+  Future<Group?> group(String id) async {
+    final rows = await _db.query(
+      'groups',
+      where: 'id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : _groupFromRow(rows.first);
+  }
+
+  @override
+  Future<List<Group>> groups() async {
+    final rows = await _db.query('groups', orderBy: 'name COLLATE NOCASE');
+    return [for (final r in rows) await _groupFromRow(r)];
+  }
+
+  @override
+  Future<void> saveGroup(Group g) async {
+    await _db.transaction((txn) async {
+      await txn.insert('groups', {
+        'id': g.id,
+        'name': g.name,
+        'creator_id': g.creatorId,
+        'version': g.version,
+        'created_at': g.createdAt.millisecondsSinceEpoch,
+        'active': g.active ? 1 : 0,
+        'admins': g.admins.join(','),
+        'admins_only': g.adminsOnlyPost ? 1 : 0,
+        'closed': g.closed ? 1 : 0,
+        'edited_by': g.editedBy,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+      await txn.delete(
+        'group_members',
+        where: 'group_id = ?',
+        whereArgs: [g.id],
+      );
+      for (final m in g.members) {
+        await txn.insert('group_members', {
+          'group_id': g.id,
+          'device_id': m.deviceId,
+          'name': m.name,
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+    _changes.add(null);
+  }
+
+  @override
+  Future<void> deleteGroup(String id) async {
+    await _db.transaction((txn) async {
+      await txn.delete(
+        'deliveries',
+        where: 'message_id IN (SELECT id FROM messages WHERE contact_id = ?)',
+        whereArgs: [id],
+      );
+      await txn.delete('messages', where: 'contact_id = ?', whereArgs: [id]);
+      await txn.delete('group_members', where: 'group_id = ?', whereArgs: [id]);
+      await txn.delete('groups', where: 'id = ?', whereArgs: [id]);
+    });
+    _changes.add(null);
+  }
+
+  @override
+  Future<void> addDeliveries(
+    String messageId,
+    Iterable<String> memberIds,
+  ) async {
+    await _db.transaction((txn) async {
+      for (final id in memberIds) {
+        await txn.insert('deliveries', {
+          'message_id': messageId,
+          'member_id': id,
+          'state': DeliveryState.pending.index,
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+    });
+  }
+
+  @override
+  Future<DeliveryState?> delivery(String messageId, String memberId) async {
+    final rows = await _db.query(
+      'deliveries',
+      columns: ['state'],
+      where: 'message_id = ? AND member_id = ?',
+      whereArgs: [messageId, memberId],
+      limit: 1,
+    );
+    return rows.isEmpty
+        ? null
+        : DeliveryState.values[rows.first['state'] as int];
+  }
+
+  @override
+  Future<void> setDelivery(
+    String messageId,
+    String memberId,
+    DeliveryState state,
+  ) async {
+    final changed = await _db.transaction<bool>((txn) async {
+      final n = await txn.update(
+        'deliveries',
+        {'state': state.index},
+        where: 'message_id = ? AND member_id = ? AND state < ?',
+        whereArgs: [messageId, memberId, state.index],
+      );
+      if (n == 0) return false;
+      final r = await txn.rawQuery(
+        'SELECT COUNT(*) AS total, '
+        'SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS done, '
+        'SUM(CASE WHEN state >= ? THEN 1 ELSE 0 END) AS sent '
+        'FROM deliveries WHERE message_id = ?',
+        [DeliveryState.delivered.index, DeliveryState.sent.index, messageId],
+      );
+      final total = (r.first['total'] as int?) ?? 0;
+      final done = (r.first['done'] as int?) ?? 0;
+      final sent = (r.first['sent'] as int?) ?? 0;
+      final target = (total > 0 && done == total)
+          ? MessageStatus.delivered
+          : (sent > 0 ? MessageStatus.sent : MessageStatus.pending);
+      await txn.update(
+        'messages',
+        {'status': target.index},
+        where: 'id = ? AND outgoing = 1 AND status < ?',
+        whereArgs: [messageId, target.index],
+      );
+      return true;
+    });
+    if (changed) _changes.add(null);
+  }
+
+  @override
+  Future<List<ChatMessage>> pendingGroupFor(String memberId) async {
+    final rows = await _db.rawQuery(
+      'SELECT m.* FROM messages m '
+      'JOIN deliveries d ON d.message_id = m.id '
+      'WHERE d.member_id = ? AND d.state < ? '
+      'ORDER BY m.sent_at ASC, m.rowid ASC',
+      [memberId, DeliveryState.delivered.index],
+    );
+    return rows.map(_messageFromRow).toList();
+  }
+
+  @override
+  Future<Map<String, DeliveryCount>> deliveryCounts(String groupId) async {
+    final rows = await _db.rawQuery(
+      'SELECT m.id AS id, COUNT(d.member_id) AS total, '
+      'SUM(CASE WHEN d.state = ? THEN 1 ELSE 0 END) AS done '
+      'FROM messages m JOIN deliveries d ON d.message_id = m.id '
+      'WHERE m.contact_id = ? AND m.outgoing = 1 GROUP BY m.id',
+      [DeliveryState.delivered.index, groupId],
+    );
+    return {
+      for (final r in rows)
+        r['id'] as String: DeliveryCount(
+          (r['done'] as int?) ?? 0,
+          (r['total'] as int?) ?? 0,
+        ),
+    };
   }
 }

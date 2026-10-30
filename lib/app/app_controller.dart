@@ -6,24 +6,85 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../bluetooth/background_service.dart';
 import '../bluetooth/ble_bridge.dart';
 import '../bluetooth/bluetooth_bridge.dart';
 import '../chat/chat_link.dart';
 import '../chat/chat_store.dart';
+import '../chat/diagnostics.dart';
+import '../chat/group_ops.dart';
 import '../chat/models.dart';
 import '../chat/sqlite_chat_store.dart';
+import '../protocol/frame.dart';
 import '../protocol/transport.dart';
 
-/// Relie la base, le Bluetooth et les connexions actives.
-class AppController extends ChangeNotifier {
+/// Relie la base, le Bluetooth et les connexions actives. Plusieurs
+/// connexions peuvent être ouvertes en même temps (jusqu'à [maxLinks]) et
+/// restent ouvertes quand l'application passe en arrière-plan.
+class AppController extends ChangeNotifier
+    with WidgetsBindingObserver
+    implements LinkHub {
   AppController._(this.store, this.identity, this.themeMode, this.filesDir) {
     _storeSub = store.changes.listen((_) => notifyListeners());
     _acceptSub = _ble.accepted.listen((t) => _attach(t));
     _foundSub = _ble.found.listen(_onFound);
     _autoTimer = Timer.periodic(
-      const Duration(seconds: 25),
+      const Duration(seconds: 20),
       (_) => unawaited(_autoCycle()),
     );
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  /// Plafond de connexions ouvertes en même temps. La vraie limite est celle
+  /// de la puce Bluetooth du téléphone, qui varie d'un modèle à l'autre :
+  /// l'application essaie jusqu'à ce plafond et retient le nombre où le
+  /// téléphone commence à refuser (voir [linkLimit]).
+  static const int maxLinks = 15;
+
+  int? _learnedMax;
+  final Map<int, int> _failsAt = {};
+
+  /// Nombre de connexions que ce téléphone accepte, d'après ce qu'on a
+  /// constaté (ou le plafond tant que rien n'a été refusé).
+  int get linkLimit => min(maxLinks, _learnedMax ?? maxLinks);
+
+  /// Le téléphone a-t-il déjà refusé une connexion supplémentaire ?
+  int? get detectedLimit => _learnedMax;
+
+  /// Une connexion vers quelqu'un qu'on venait de voir a échoué alors qu'on
+  /// en avait déjà [n] : deux échecs au même nombre = la limite du téléphone.
+  void _noteConnectFailure() {
+    final n = _byContact.length;
+    if (n < 2) return;
+    final fails = (_failsAt[n] ?? 0) + 1;
+    _failsAt[n] = fails;
+    if (fails >= 2 && (_learnedMax == null || n < _learnedMax!)) {
+      _learnedMax = n;
+      Diagnostics.log('Limite détectée : ce téléphone accepte $n connexions');
+      unawaited(
+        store.saveSetting(
+          'link_limit',
+          '$n@${DateTime.now().millisecondsSinceEpoch}',
+        ),
+      );
+      notifyListeners();
+    }
+  }
+
+  Future<void> _loadLinkLimit() async {
+    final raw = await store.setting('link_limit');
+    if (raw == null) return;
+    final parts = raw.split('@');
+    if (parts.length != 2) return;
+    final n = int.tryParse(parts[0]);
+    final at = int.tryParse(parts[1]);
+    if (n == null || at == null) return;
+    final when = DateTime.fromMillisecondsSinceEpoch(at);
+    // Une limite constatée n'est valable que quelques heures : on réessaie
+    // ensuite, car elle dépendait peut-être de la distance.
+    if (DateTime.now().difference(when) < const Duration(hours: 6)) {
+      _learnedMax = n;
+    }
   }
 
   static Future<AppController> start() async {
@@ -38,7 +99,10 @@ class AppController extends ChangeNotifier {
     final docs = await getApplicationDocumentsDirectory();
     final filesDir = Directory('${docs.path}${Platform.pathSeparator}files');
     await filesDir.create(recursive: true);
-    return AppController._(store, identity, mode, filesDir);
+    final c = AppController._(store, identity, mode, filesDir);
+    c.keepRunning = await store.setting('background') != '0';
+    await c._loadLinkLimit();
+    return c;
   }
 
   final ChatStore store;
@@ -58,8 +122,25 @@ class AppController extends ChangeNotifier {
   late final StreamSubscription<NearbyUser> _foundSub;
   late final Timer _autoTimer;
 
+  final BackgroundService _service = BackgroundService.instance;
+
   final Set<ChatLink> _active = {};
   final Map<String, ChatLink> _byContact = {};
+  final Set<String> _connecting = {}; // débuts d'identifiant en cours de connexion
+  final Map<String, DateTime> _lastAttempt = {};
+  final Map<String, DateTime> _noAutoUntil = {};
+  final Set<String> _seenReceipts = {};
+  Future<void> _connectTail = Future<void>.value();
+
+  ChatLink? _fileSlot; // la liaison qui envoie un gros fichier en ce moment
+  final Set<String> _receivingIds = {};
+  final Map<String, DateTime> _lastProgressNotify = {};
+
+  /// Rester connecté quand on quitte l'application (service de premier plan).
+  bool keepRunning = true;
+  bool _serviceOn = false;
+  String _serviceText = '';
+  bool _foreground = true;
 
   // Mode de secours (association)
   bool _wantListen = false;
@@ -75,6 +156,130 @@ class AppController extends ChangeNotifier {
 
   bool get hasActiveConnection => _active.isNotEmpty;
   bool isConnected(String contactId) => _byContact.containsKey(contactId);
+
+  /// Nombre de personnes connectées en ce moment.
+  int get connectedCount => _byContact.length;
+
+  /// Combien de membres de ce groupe (hors nous) sont connectés.
+  int connectedMembers(Group g) => g.members
+      .where((m) => m.deviceId != identity?.deviceId && isConnected(m.deviceId))
+      .length;
+
+  // ---------- Pour les connexions (LinkHub) ----------
+
+  @override
+  Iterable<ChatLink> get links => _active;
+
+  @override
+  bool firstTimeSeen(String key) {
+    if (_seenReceipts.length > 3000) _seenReceipts.clear();
+    return _seenReceipts.add(key);
+  }
+
+  @override
+  bool get transferring => progress.isNotEmpty || _active.any((l) => l.busy);
+
+  @override
+  bool acquireFileSlot(ChatLink link) {
+    if (_fileSlot == null || identical(_fileSlot, link)) {
+      _fileSlot = link;
+      return true;
+    }
+    return false;
+  }
+
+  @override
+  void releaseFileSlot(ChatLink link) {
+    if (identical(_fileSlot, link)) {
+      _fileSlot = null;
+      // Le prochain qui attendait son tour peut partir.
+      unawaited(_deliverAll());
+    }
+  }
+
+  @override
+  bool beginReceiving(String messageId) => _receivingIds.add(messageId);
+
+  @override
+  void endReceiving(String messageId) => _receivingIds.remove(messageId);
+
+  @override
+  void membershipChanged() {
+    notifyListeners();
+    unawaited(_autoCycle());
+  }
+
+  @override
+  void messageReceived(ChatMessage message) {
+    if (_foreground) return;
+    unawaited(_notifyIncoming(message));
+  }
+
+  Future<void> _notifyIncoming(ChatMessage m) async {
+    final String title;
+    final String body;
+    final what = switch (m.kind) {
+      MessageKind.text => m.text,
+      MessageKind.image => 'Image',
+      MessageKind.audio => 'Message vocal',
+      MessageKind.file => m.fileName ?? 'Fichier',
+    };
+    if (m.isGroupMessage) {
+      final g = await store.group(m.contactId);
+      title = g?.name ?? 'Groupe';
+      body = '${m.senderName ?? 'Membre'} : $what';
+    } else {
+      title = (await store.contact(m.contactId))?.name ?? 'BlueTalk';
+      body = what;
+    }
+    await _service.notify(
+      id: m.contactId.hashCode & 0x7fffffff,
+      title: title,
+      body: body,
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final wasForeground = _foreground;
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground && !wasForeground) {
+      notifyListeners();
+      unawaited(_autoCycle());
+    }
+  }
+
+  /// Bouton Retour sur l'écran principal : on met l'application de côté sans
+  /// la fermer, pour que les connexions continuent.
+  Future<void> goToBackground() => _service.moveToBack();
+
+  // ---------- Présence en arrière-plan ----------
+
+  Future<void> setKeepRunning(bool on) async {
+    keepRunning = on;
+    notifyListeners();
+    await store.saveSetting('background', on ? '1' : '0');
+    if (on) {
+      await _updateService();
+    } else {
+      _serviceOn = false;
+      _serviceText = '';
+      await _service.stop();
+    }
+  }
+
+  Future<void> _updateService() async {
+    if (identity == null || !_blePermOk || !keepRunning) return;
+    final n = _byContact.length;
+    final text = n == 0
+        ? 'En attente de contacts à proximité'
+        : n == 1
+        ? 'Connecté à 1 appareil'
+        : 'Connecté à $n appareils';
+    if (_serviceOn && text == _serviceText) return;
+    _serviceText = text;
+    _serviceOn = await _service.start(text);
+  }
 
   String get _myIdHex => identity!.deviceId.substring(0, 8);
 
@@ -171,6 +376,8 @@ class AppController extends ChangeNotifier {
     }
     notifyListeners();
     await store.saveSetting('visible', '1');
+    unawaited(_service.ensureNotifications());
+    await _updateService();
   }
 
   /// Au démarrage : visible, sauf si l'utilisateur a choisi le contraire.
@@ -212,12 +419,19 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Ouvre une connexion depuis la liste « Rechercher ». La recherche reste
+  /// active : on peut en ouvrir plusieurs à la suite.
   Future<bool> connectNearby(NearbyUser u) async {
     lastError = null;
     if (!await _prepareBle()) return false;
-    await stopScan();
+    if (_active.length >= linkLimit) {
+      _fail('Déjà $linkLimit connexions ouvertes : coupe-en une d\'abord.');
+      return false;
+    }
+    final contactId = _knownId(u.idHex);
+    if (contactId != null) _noAutoUntil.remove(contactId);
     try {
-      _attach(await _ble.connect(u.address, u.psm));
+      await _connectTo(u);
       return true;
     } catch (e) {
       _fail('Connexion impossible : $e');
@@ -225,65 +439,111 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  // ---------- Livraison automatique ----------
+  /// L'identifiant complet d'une personne déjà connectée, d'après son début.
+  String? _knownId(String idHex) =>
+      _byContact.keys.where((k) => k.startsWith(idHex)).firstOrNull;
 
-  /// Si des messages attendent un contact, on le cherche et on se connecte
-  /// à lui dès qu'il est à portée.
+  /// Est-ce que cette personne est déjà connectée ? (pour l'écran de recherche)
+  bool isNearbyConnected(NearbyUser u) => _knownId(u.idHex) != null;
+
+  /// Ouvre une connexion, une à la fois : Android supporte mal plusieurs
+  /// ouvertures simultanées.
+  Future<void> _connectTo(NearbyUser u) {
+    final job = _connectTail.then((_) async {
+      if (_knownId(u.idHex) != null || _connecting.contains(u.idHex)) return;
+      _connecting.add(u.idHex);
+      Diagnostics.log(
+        'Connexion vers ${u.name} (${_active.length} déjà ouverte(s))',
+      );
+      try {
+        final t = await _ble.connect(u.address, u.psm);
+        _failsAt.clear();
+        _attach(t, initiator: true);
+      } catch (e) {
+        Diagnostics.log('Connexion vers ${u.name} échouée : $e');
+        _noteConnectFailure();
+        rethrow;
+      } finally {
+        _connecting.remove(u.idHex);
+      }
+    });
+    _connectTail = job.catchError((_) {});
+    return job;
+  }
+
+  // ---------- Connexions automatiques ----------
+
+  /// Les personnes avec qui on veut rester connecté : les membres de nos
+  /// groupes (pour discuter en direct) et les contacts à qui des messages
+  /// attendent.
+  Future<Set<String>> _wantedIds() async {
+    final me = identity!.deviceId;
+    final ids = <String>{};
+    for (final g in await store.groups()) {
+      if (!g.active) continue;
+      for (final m in g.members) {
+        if (m.deviceId != me) ids.add(m.deviceId);
+      }
+    }
+    for (final c in await store.contacts()) {
+      if ((await store.pendingFor(c.deviceId)).isNotEmpty) ids.add(c.deviceId);
+    }
+    final now = DateTime.now();
+    ids.removeWhere((id) {
+      final until = _noAutoUntil[id];
+      return until != null && now.isBefore(until);
+    });
+    return ids;
+  }
+
+  /// Cherche les personnes voulues qui sont à portée et s'y connecte, jusqu'à
+  /// [maxLinks]. Revient toutes les 20 secondes, et après chaque coupure :
+  /// une personne qui s'éloigne puis revient est reconnectée seule.
   Future<void> _autoCycle() async {
-    if (_autoBusy || identity == null || scanning || _active.isNotEmpty) return;
+    if (_autoBusy || identity == null || _active.length >= linkLimit) return;
+    // Pendant un transfert, on ne cherche personne : un scan Bluetooth ralentit
+    // les liaisons ouvertes et peut les couper.
+    if (transferring) return;
     _autoBusy = true;
     try {
-      final targets = <Contact>[];
-      for (final c in await store.contacts()) {
-        if ((await store.pendingFor(c.deviceId)).isNotEmpty) targets.add(c);
-      }
-      if (targets.isEmpty || !await _prepareBle(ask: false)) return;
+      final wanted = await _wantedIds();
+      wanted.removeWhere(_byContact.containsKey);
+      if (wanted.isEmpty || !await _prepareBle(ask: false)) return;
 
-      await _ble.startScan();
-      await Future<void>.delayed(const Duration(seconds: 6));
-      try {
-        await _ble.stopScan();
-      } catch (_) {}
-
-      for (final c in targets) {
-        final user = nearbyUsers
-            .where((u) => c.deviceId.startsWith(u.idHex))
-            .firstOrNull;
-        if (user == null) continue;
-        // Petit délai aléatoire : si l'autre téléphone se connecte à nous
-        // au même moment, l'un des deux cède la place.
-        await Future<void>.delayed(
-          Duration(milliseconds: Random().nextInt(1500)),
-        );
-        if (_active.isNotEmpty) return;
+      // Si l'écran « Rechercher » scanne déjà, on utilise ses résultats.
+      if (!scanning) {
+        await _ble.startScan();
+        await Future<void>.delayed(const Duration(seconds: 5));
         try {
-          _attach(await _ble.connect(user.address, user.psm), autoClose: true);
+          await _ble.stopScan();
         } catch (_) {}
-        return;
+      }
+
+      for (final u in nearbyUsers) {
+        if (_active.length + _connecting.length >= linkLimit) break;
+        final id = wanted.where((w) => w.startsWith(u.idHex)).firstOrNull;
+        if (id == null || _byContact.containsKey(id)) continue;
+        final last = _lastAttempt[id];
+        if (last != null &&
+            DateTime.now().difference(last) < const Duration(seconds: 12)) {
+          continue;
+        }
+        _lastAttempt[id] = DateTime.now();
+        // Petit délai aléatoire : si l'autre téléphone se connecte à nous au
+        // même moment, une seule des deux connexions est gardée.
+        await Future<void>.delayed(
+          Duration(milliseconds: Random().nextInt(1200)),
+        );
+        if (_byContact.containsKey(id)) continue;
+        try {
+          await _connectTo(u);
+        } catch (_) {}
       }
     } catch (_) {
       // Rien de grave : on réessaiera au prochain passage.
     } finally {
       _autoBusy = false;
     }
-  }
-
-  /// Ferme une connexion automatique une fois tout livré et plus rien en cours.
-  void _watchIdle(ChatLink link, String contactId) {
-    var idle = 0;
-    Timer.periodic(const Duration(seconds: 4), (t) async {
-      if (!_active.contains(link)) {
-        t.cancel();
-        return;
-      }
-      final busy =
-          progress.isNotEmpty || (await store.pendingFor(contactId)).isNotEmpty;
-      idle = busy ? 0 : idle + 1;
-      if (idle >= 3) {
-        t.cancel();
-        await link.close();
-      }
-    });
   }
 
   // ---------- Mode de secours : association Bluetooth ----------
@@ -334,7 +594,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> _listenLoop() async {
     while (_wantListen) {
-      if (_active.isNotEmpty) {
+      if (_active.length >= linkLimit) {
         await Future<void>.delayed(const Duration(seconds: 1));
         continue;
       }
@@ -364,13 +624,32 @@ class AppController extends ChangeNotifier {
   void _onProgress(String messageId, double p) {
     if (p < 0 || p >= 1) {
       progress.remove(messageId);
-    } else {
-      progress[messageId] = p;
+      _lastProgressNotify.remove(messageId);
+      notifyListeners();
+      return;
     }
-    notifyListeners();
+    progress[messageId] = p;
+    // On ne redessine pas l'écran à chaque bloc reçu : cela ralentissait les
+    // transferts. Quelques mises à jour par seconde suffisent.
+    final now = DateTime.now();
+    final last = _lastProgressNotify[messageId];
+    if (last == null ||
+        now.difference(last) > const Duration(milliseconds: 400)) {
+      _lastProgressNotify[messageId] = now;
+      notifyListeners();
+    }
   }
 
-  void _attach(Transport transport, {String? address, bool autoClose = false}) {
+  void _attach(Transport transport, {String? address, bool initiator = false}) {
+    if (_active.length >= linkLimit) {
+      Diagnostics.log('Connexion reçue refusée : limite de $linkLimit atteinte');
+      unawaited(transport.close());
+      return;
+    }
+    Diagnostics.log(
+      'Connexion ${initiator ? 'ouverte' : 'reçue'} '
+      '(${_active.length + 1} au total)',
+    );
     final link = ChatLink(
       transport: transport,
       store: store,
@@ -378,24 +657,49 @@ class AppController extends ChangeNotifier {
       address: address,
       filesDir: filesDir,
       onProgress: _onProgress,
+      initiator: initiator,
+      hub: this,
+      keepAlive: const Duration(seconds: 20),
     );
     _active.add(link);
     notifyListeners();
 
     link.ready.then((contactId) {
+      final existing = _byContact[contactId];
+      if (existing != null && !identical(existing, link)) {
+        // Deux connexions avec la même personne (chacun a appelé l'autre en
+        // même temps). Les deux téléphones gardent la même : celle ouverte
+        // par la personne dont l'identifiant est le plus petit.
+        final me = identity!.deviceId;
+        final smaller = me.compareTo(contactId) < 0 ? me : contactId;
+        String initiatorOf(ChatLink l) => l.initiator ? me : contactId;
+        if (initiatorOf(link) == smaller && initiatorOf(existing) != smaller) {
+          unawaited(existing.close());
+        } else {
+          unawaited(link.close());
+          return;
+        }
+      }
       _byContact[contactId] = link;
       notifyListeners();
-      if (autoClose) _watchIdle(link, contactId);
+      unawaited(_updateService());
     }, onError: (_) {});
 
     link.closed.then((_) {
+      if (identical(_fileSlot, link)) _fileSlot = null;
       _active.remove(link);
       _byContact.removeWhere((_, l) => identical(l, link));
       notifyListeners();
+      unawaited(_updateService());
+      // La personne est peut-être juste sortie de portée : on la recherche.
+      Timer(const Duration(seconds: 4), () => unawaited(_autoCycle()));
     });
   }
 
+  /// Coupe la connexion avec quelqu'un. On ne le reconnecte pas tout seul
+  /// pendant les 5 minutes qui suivent.
   Future<void> disconnect(String contactId) async {
+    _noAutoUntil[contactId] = DateTime.now().add(const Duration(minutes: 5));
     await _byContact[contactId]?.close();
   }
 
@@ -403,43 +707,73 @@ class AppController extends ChangeNotifier {
 
   /// Écrit un message. Il est enregistré tout de suite (« en attente ») et
   /// part immédiatement si le contact est connecté, sinon dès qu'il est à portée.
-  Future<void> sendText(String contactId, String text) async {
+  Future<void> sendText(String conversationId, String text) async {
     final t = text.trim();
     if (t.isEmpty) return;
-    await store.addMessage(ChatMessage.draft(contactId: contactId, text: t));
-    await _deliverNow(contactId);
+    final g = await store.group(conversationId);
+    if (g != null) {
+      if (!g.canPost(identity!.deviceId)) return;
+      await queueGroupText(store, identity!, g, t);
+      await _deliverAll();
+      return;
+    }
+    await store.addMessage(
+      ChatMessage.draft(contactId: conversationId, text: t),
+    );
+    await _deliverNow(conversationId);
   }
 
-  /// Envoie un fichier ou une image. Renvoie un message d'erreur, ou null si
-  /// tout va bien. Le fichier est d'abord copié dans le dossier de
-  /// l'application, pour qu'il reste disponible même si l'original disparaît.
+  /// Envoie un fichier, une image ou un message vocal (à une personne ou à
+  /// un groupe). Renvoie un message d'erreur, ou null si tout va bien. Le
+  /// fichier est d'abord copié dans le dossier de l'application, pour qu'il
+  /// reste disponible même si l'original disparaît.
   Future<String?> sendFile(
-    String contactId, {
+    String conversationId, {
     required String sourcePath,
     required String name,
-    required bool image,
+    bool image = false,
+    MessageKind? kind,
+    int? durationMs,
   }) async {
     try {
-      final src = File(sourcePath);
-      final size = await src.length();
+      final size = await File(sourcePath).length();
       if (size > maxFileSize) {
         return 'Fichier trop volumineux (maximum '
             '${maxFileSize ~/ (1024 * 1024)} Mo).';
       }
-      final safe = name.replaceAll(RegExp(r'[\\/]'), '_');
-      final stored =
-          '${filesDir.path}${Platform.pathSeparator}${generateId()}_$safe';
-      await src.copy(stored);
+      final stored = await copyIntoStorage(filesDir, sourcePath, name);
+      final k = kind ?? (image ? MessageKind.image : MessageKind.file);
+      final g = await store.group(conversationId);
+      if (g != null) {
+        if (!g.canPost(identity!.deviceId)) {
+          return g.adminsOnlyPost
+              ? 'Seuls les administrateurs peuvent écrire dans ce groupe.'
+              : 'Tu ne fais plus partie de ce groupe.';
+        }
+        await queueGroupFile(
+          store,
+          identity!,
+          g,
+          kind: k,
+          fileName: name,
+          fileSize: size,
+          storedPath: stored,
+          durationMs: durationMs,
+        );
+        await _deliverAll();
+        return null;
+      }
       await store.addMessage(
         ChatMessage.draftFile(
-          contactId: contactId,
-          kind: image ? MessageKind.image : MessageKind.file,
+          contactId: conversationId,
+          kind: k,
           fileName: name,
           fileSize: size,
           filePath: stored,
+          durationMs: durationMs,
         ),
       );
-      await _deliverNow(contactId);
+      await _deliverNow(conversationId);
       return null;
     } catch (e) {
       return 'Impossible d\'envoyer ce fichier : $e';
@@ -453,14 +787,138 @@ class AppController extends ChangeNotifier {
         await link.flush();
       } catch (_) {}
     } else {
-      unawaited(
-        _autoCycle(),
-      ); // on le cherche sans attendre le prochain passage
+      unawaited(_autoCycle()); // on le cherche sans attendre le prochain passage
+    }
+  }
+
+  /// Fait partir ce qui attend sur toutes les connexions ouvertes.
+  Future<void> _deliverAll() async {
+    for (final l in _active.toList()) {
+      if (l.remoteId == null) continue;
+      try {
+        await l.flush();
+      } catch (_) {}
+    }
+    unawaited(_autoCycle());
+  }
+
+  // ---------- Groupes ----------
+
+  /// Crée un groupe avec des personnes déjà rencontrées. Le groupe se diffuse
+  /// tout seul : à ceux qui sont connectés tout de suite, aux autres dès
+  /// qu'ils sont à portée.
+  Future<Group?> createGroup(String name, List<Contact> members) async {
+    final n = name.trim();
+    if (identity == null || n.isEmpty || members.isEmpty) return null;
+    final g = newGroup(identity!, n, members);
+    await store.saveGroup(g);
+    await _pushGroup(g);
+    unawaited(_autoCycle());
+    return g;
+  }
+
+  /// Modifie un groupe : réservé au créateur et aux administrateurs. Seul le
+  /// créateur nomme les administrateurs et supprime le groupe ; un
+  /// administrateur ne peut pas retirer le créateur ni un autre administrateur.
+  /// Renvoie la nouvelle version, ou null si la modification est refusée.
+  Future<Group?> updateGroup(
+    Group g, {
+    String? name,
+    List<GroupMember>? members,
+    List<String>? admins,
+    bool? adminsOnlyPost,
+  }) async {
+    final me = identity?.deviceId;
+    if (me == null || !g.isAdmin(me) || !g.active) return null;
+    final isCreator = g.creatorId == me;
+    if (admins != null && !isCreator) return null;
+    if (members != null) {
+      final keep = members.map((m) => m.deviceId).toSet();
+      if (!keep.contains(g.creatorId)) return null;
+      for (final old in g.members) {
+        if (keep.contains(old.deviceId)) continue;
+        if (!isCreator && g.isAdmin(old.deviceId)) return null;
+      }
+    }
+    final next = editedGroup(
+      g,
+      by: me,
+      name: name,
+      members: members,
+      admins: admins,
+      adminsOnlyPost: adminsOnlyPost,
+    );
+    await store.saveGroup(next);
+    final removed = g.members
+        .map((m) => m.deviceId)
+        .where((id) => !next.hasMember(id));
+    await _pushGroup(next, alsoTo: removed);
+    unawaited(_autoCycle());
+    return next;
+  }
+
+  Future<Group?> addMember(Group g, Contact c) => updateGroup(
+    g,
+    members: [...g.members, GroupMember(deviceId: c.deviceId, name: c.name)],
+  );
+
+  Future<Group?> removeMember(Group g, String deviceId) => updateGroup(
+    g,
+    members: g.members.where((m) => m.deviceId != deviceId).toList(),
+  );
+
+  /// Nomme ou retire un administrateur (créateur uniquement).
+  Future<Group?> setAdmin(Group g, String deviceId, bool admin) {
+    final list = g.admins.where((a) => a != deviceId).toList();
+    if (admin) list.add(deviceId);
+    return updateGroup(g, admins: list);
+  }
+
+  /// Active ou non le mode annonces (seuls les administrateurs écrivent).
+  Future<Group?> setAdminsOnlyPost(Group g, bool on) =>
+      updateGroup(g, adminsOnlyPost: on);
+
+  /// Supprime le groupe pour tous ses membres (créateur uniquement).
+  Future<bool> closeGroup(Group g) async {
+    final me = identity?.deviceId;
+    if (me == null || g.creatorId != me || !g.active) return false;
+    final next = editedGroup(g, by: me, closed: true);
+    await _pushGroup(next);
+    await store.saveGroup(next.copyWith(active: false));
+    return true;
+  }
+
+  /// Quitte un groupe (impossible pour son créateur). Le créateur en est
+  /// prévenu, directement ou par un autre membre.
+  Future<void> leaveGroup(Group g) async {
+    final me = identity;
+    if (me == null || g.creatorId == me.deviceId) return;
+    final frame = Frame.json(FrameType.groupLeave, {
+      'gid': g.id,
+      'who': me.deviceId,
+    });
+    for (final l in _active.toList()) {
+      final id = l.remoteId;
+      if (id != null && g.hasMember(id)) await l.sendFrame(frame);
+    }
+    await store.saveGroup(g.copyWith(active: false));
+  }
+
+  Future<void> deleteGroup(String id) => store.deleteGroup(id);
+
+  Future<void> _pushGroup(Group g, {Iterable<String> alsoTo = const []}) async {
+    final extra = alsoTo.toSet();
+    for (final l in _active.toList()) {
+      final id = l.remoteId;
+      if (id != null && (g.hasMember(id) || extra.contains(id))) {
+        await l.sendGroupInfo(g);
+      }
     }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _autoTimer.cancel();
     _storeSub.cancel();
     _acceptSub.cancel();

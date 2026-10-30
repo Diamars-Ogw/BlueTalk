@@ -26,13 +26,20 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.IOException
 import java.io.OutputStream
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Découverte par balises Bluetooth basse consommation, et canal de données
+ * Découverte par balises Bluetooth basse consommation, et canaux de données
  * L2CAP (sans association). La balise annonce : un identifiant de service
  * propre à BlueTalk, le numéro du canal (PSM), un court identifiant et le
  * nom d'utilisateur.
+ *
+ * Plusieurs connexions peuvent être ouvertes en même temps. Chacune a un
+ * numéro (cid) que Dart retrouve dans chaque évènement et chaque appel.
  */
 class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
 
@@ -41,10 +48,26 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
         const val COMPANY_ID = 0xFFFF // identifiant réservé aux essais
         const val PERMISSION_CODE = 4343
         const val NAME_BYTES = 20
+
+        /**
+         * Plafond de sécurité des connexions simultanées (reçues + ouvertes).
+         * La vraie limite est celle de la puce Bluetooth du téléphone : elle
+         * refuse toute seule au-delà, et l'application s'adapte (voir Dart).
+         */
+        const val MAX_LINKS = 15
+    }
+
+    /** Une connexion ouverte. Ses écritures partent dans l'ordre, sans gêner les autres. */
+    private class Conn(
+        val id: Int,
+        val socket: BluetoothSocket,
+        val output: OutputStream,
+        val writeLimit: Int
+    ) {
+        val writer: ExecutorService = Executors.newSingleThreadExecutor()
     }
 
     private val main = Handler(Looper.getMainLooper())
-    private val writer = Executors.newSingleThreadExecutor() // écritures dans l'ordre
     private val lock = Any()
 
     private var events: EventChannel.EventSink? = null
@@ -53,9 +76,10 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
     private var server: BluetoothServerSocket? = null
     private var advertiseCallback: AdvertiseCallback? = null
     private var scanCallback: ScanCallback? = null
-    private var socket: BluetoothSocket? = null
-    private var output: OutputStream? = null
-    private var writeLimit = 512
+
+    private val connections = ConcurrentHashMap<Int, Conn>()
+    private val connecting = ConcurrentHashMap<Int, BluetoothSocket>() // demande -> socket en cours
+    private val nextCid = AtomicInteger(1)
 
     private val adapter: BluetoothAdapter?
         get() = (activity.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
@@ -84,9 +108,21 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
                 "stopAdvertising" -> { stopAdvertising(); result.success(null) }
                 "startScan" -> startScan(result)
                 "stopScan" -> { stopScan(); result.success(null) }
-                "connect" -> connectTo(call.argument<String>("address"), call.argument<Int>("psm"), result)
-                "send" -> send(call.argument<ByteArray>("bytes"), result)
-                "close" -> { closeConnection(); result.success(null) }
+                "connect" -> connectTo(
+                    call.argument<String>("address"),
+                    call.argument<Int>("psm"),
+                    call.argument<Int>("req") ?: 0,
+                    result
+                )
+                "cancelConnect" -> {
+                    connecting.remove(call.argument<Int>("req") ?: 0)?.let {
+                        try { it.close() } catch (_: IOException) {}
+                    }
+                    result.success(null)
+                }
+                "send" -> send(call.argument<Int>("cid"), call.argument<ByteArray>("bytes"), result)
+                "close" -> { closeConnection(call.argument<Int>("cid")); result.success(null) }
+                "closeAll" -> { closeAll(); result.success(null) }
                 else -> result.notImplemented()
             }
         }
@@ -227,12 +263,12 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
                 } catch (e: IOException) {
                     break // socket fermé : on arrête d'écouter
                 }
-                val busy = synchronized(lock) { socket != null }
-                if (busy) {
+                // Trop de connexions : on refuse celle-ci, les autres continuent.
+                if (connections.size + connecting.size >= MAX_LINKS) {
                     try { s.close() } catch (_: IOException) {}
                     continue
                 }
-                Thread { attach(s, "server") }.start()
+                Thread { attach(s, "server", 0) }.start()
             }
         }.start()
     }
@@ -249,6 +285,7 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
         try {
             if (cb != null) adapter?.bluetoothLeAdvertiser?.stopAdvertising(cb)
         } catch (_: Exception) {}
+        // Les connexions déjà ouvertes ne sont pas touchées.
         try { srv?.close() } catch (_: IOException) {}
     }
 
@@ -320,7 +357,7 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
     // ---------- Se connecter ----------
 
     @SuppressLint("NewApi", "MissingPermission")
-    private fun connectTo(address: String?, psm: Int?, result: MethodChannel.Result) {
+    private fun connectTo(address: String?, psm: Int?, req: Int, result: MethodChannel.Result) {
         val a = adapter
         if (address == null || psm == null || a == null || !a.isEnabled) {
             result.error("disabled", "Bluetooth désactivé ou adresse manquante", null)
@@ -328,6 +365,10 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
         }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             result.error("unsupported", "Android 10 ou plus récent requis", null)
+            return
+        }
+        if (connections.size + connecting.size >= MAX_LINKS) {
+            result.error("limit", "Trop de connexions ouvertes en même temps", null)
             return
         }
         result.success(null)
@@ -338,40 +379,61 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
                 val device = a.getRemoteDevice(address)
                 val sock = device.createInsecureL2capChannel(psm)
                 pending = sock
+                connecting[req] = sock
                 sock.connect() // bloque jusqu'à la connexion ou l'échec
-                attach(sock, "client")
+                if (connecting.remove(req) == null) {
+                    // Annulée entre-temps (délai dépassé côté Dart).
+                    try { sock.close() } catch (_: IOException) {}
+                    return@Thread
+                }
+                attach(sock, "client", req)
             } catch (e: Exception) {
+                connecting.remove(req)
                 try { pending?.close() } catch (_: IOException) {}
-                emit(mapOf("type" to "error", "message" to (e.message ?: "Connexion impossible")))
+                emit(
+                    mapOf(
+                        "type" to "error",
+                        "req" to req,
+                        "message" to (e.message ?: "Connexion impossible")
+                    )
+                )
             }
         }.start()
     }
 
-    // ---------- Connexion active ----------
+    // ---------- Connexions actives ----------
 
     /** Prend en charge une connexion établie. Bloque (lecture) jusqu'à sa fin. */
     @SuppressLint("MissingPermission")
-    private fun attach(s: BluetoothSocket, role: String) {
-        val previous = synchronized(lock) {
-            val old = socket
-            socket = s
-            output = null
-            old
+    private fun attach(s: BluetoothSocket, role: String, req: Int) {
+        val input = try {
+            s.inputStream
+        } catch (e: IOException) {
+            try { s.close() } catch (_: IOException) {}
+            return
         }
-        try { previous?.close() } catch (_: IOException) {}
-
-        val input = s.inputStream
+        val out = try {
+            s.outputStream
+        } catch (e: IOException) {
+            try { s.close() } catch (_: IOException) {}
+            return
+        }
         val mtu = s.maxTransmitPacketSize
-        synchronized(lock) {
-            output = s.outputStream
-            writeLimit = if (mtu > 0) minOf(mtu, 4096) else 512
-        }
+        val conn = Conn(
+            nextCid.getAndIncrement(),
+            s,
+            out,
+            if (mtu > 0) minOf(mtu, 4096) else 512
+        )
+        connections[conn.id] = conn
 
         val name = try { s.remoteDevice.name } catch (_: SecurityException) { null }
         emit(
             mapOf(
                 "type" to "connected",
+                "cid" to conn.id,
                 "role" to role,
+                "req" to req,
                 "name" to (name ?: s.remoteDevice.address),
                 "address" to s.remoteDevice.address,
                 "mtu" to mtu
@@ -383,54 +445,60 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
             while (true) {
                 val n = input.read(buffer)
                 if (n < 0) break
-                emit(mapOf("type" to "data", "bytes" to buffer.copyOf(n)))
+                emit(mapOf("type" to "data", "cid" to conn.id, "bytes" to buffer.copyOf(n)))
             }
         } catch (_: IOException) {
             // connexion coupée
         } finally {
-            val wasCurrent = synchronized(lock) {
-                if (socket === s) {
-                    socket = null
-                    output = null
-                    true
-                } else false
-            }
+            connections.remove(conn.id)
+            conn.writer.shutdown()
             try { s.close() } catch (_: IOException) {}
-            if (wasCurrent) emit(mapOf("type" to "disconnected"))
+            emit(mapOf("type" to "disconnected", "cid" to conn.id))
         }
     }
 
-    private fun send(bytes: ByteArray?, result: MethodChannel.Result) {
-        val (out, limit) = synchronized(lock) { Pair(output, writeLimit) }
-        if (bytes == null || out == null) {
+    private fun send(cid: Int?, bytes: ByteArray?, result: MethodChannel.Result) {
+        val conn = if (cid != null) connections[cid] else null
+        if (bytes == null || conn == null) {
             result.error("not_connected", "Aucune connexion active", null)
             return
         }
-        writer.execute {
-            try {
-                // Découpé à la taille maximale d'un paquet du canal.
-                var i = 0
-                while (i < bytes.size) {
-                    val n = minOf(limit, bytes.size - i)
-                    out.write(bytes, i, n)
-                    i += n
+        try {
+            conn.writer.execute {
+                try {
+                    // Découpé à la taille maximale d'un paquet du canal.
+                    var i = 0
+                    while (i < bytes.size) {
+                        val n = minOf(conn.writeLimit, bytes.size - i)
+                        conn.output.write(bytes, i, n)
+                        i += n
+                    }
+                    conn.output.flush()
+                    main.post { result.success(null) }
+                } catch (e: IOException) {
+                    // Écriture impossible : cette connexion est perdue.
+                    try { conn.socket.close() } catch (_: IOException) {}
+                    main.post { result.error("write", e.message ?: "Écriture impossible", null) }
                 }
-                out.flush()
-                main.post { result.success(null) }
-            } catch (e: IOException) {
-                main.post { result.error("write", e.message ?: "Écriture impossible", null) }
             }
+        } catch (e: RejectedExecutionException) {
+            result.error("not_connected", "Connexion fermée", null)
         }
     }
 
-    private fun closeConnection() {
-        val s = synchronized(lock) {
-            val x = socket
-            socket = null
-            output = null
-            x
+    private fun closeConnection(cid: Int?) {
+        if (cid == null) return
+        try { connections[cid]?.socket?.close() } catch (_: IOException) {}
+    }
+
+    private fun closeAll() {
+        for (c in connections.values) {
+            try { c.socket.close() } catch (_: IOException) {}
         }
-        try { s?.close() } catch (_: IOException) {}
+        for (s in connecting.values) {
+            try { s.close() } catch (_: IOException) {}
+        }
+        connecting.clear()
     }
 
     private fun emit(event: Map<String, Any?>) {
@@ -438,7 +506,7 @@ class BleBridge(private val activity: Activity, messenger: BinaryMessenger) {
     }
 
     fun shutdown() {
-        closeConnection()
+        closeAll()
         stopScan()
         stopAdvertising()
     }

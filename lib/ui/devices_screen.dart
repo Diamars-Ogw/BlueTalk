@@ -49,10 +49,12 @@ class _DevicesScreenState extends State<DevicesScreen> {
     setState(() => _busy = true);
     final ok = await widget.controller.connectNearby(u);
     if (!mounted) return;
+    setState(() => _busy = false);
     if (ok) {
-      Navigator.of(context).pop();
-    } else {
-      setState(() => _busy = false);
+      // On reste sur la liste : on peut se connecter à d'autres personnes.
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Connecté à ${u.name}')),
+      );
     }
   }
 
@@ -89,7 +91,8 @@ class _DevicesScreenState extends State<DevicesScreen> {
             child: Text(
               'Les utilisateurs de BlueTalk à proximité apparaissent ici. '
               'Chacun doit avoir l\'application ouverte et « Visible à '
-              'proximité » activé.',
+              'proximité » activé. Tu peux te connecter à plusieurs '
+              'personnes en même temps.',
               style: TextStyle(color: colors.subtleText),
             ),
           ),
@@ -139,10 +142,20 @@ class _DevicesScreenState extends State<DevicesScreen> {
                 style: const TextStyle(fontWeight: FontWeight.w600),
               ),
               subtitle: Text(
-                _proximity(u.rssi),
+                c.isNearbyConnected(u)
+                    ? 'connecté · ${_proximity(u.rssi)}'
+                    : _proximity(u.rssi),
                 style: TextStyle(color: colors.subtleText),
               ),
-              onTap: _busy ? null : () => _connectNearby(u),
+              trailing: c.isNearbyConnected(u)
+                  ? Icon(
+                      Icons.check_circle,
+                      color: Theme.of(context).colorScheme.primary,
+                    )
+                  : null,
+              onTap: (_busy || c.isNearbyConnected(u))
+                  ? null
+                  : () => _connectNearby(u),
             ),
           const Divider(),
           ExpansionTile(
